@@ -39,7 +39,7 @@ app = FastAPI()
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://events.emurpg.com"],  # PROD: https://events.emurpg.com
+    allow_origins=["*"],  # PROD: https://events.emurpg.com
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,6 +52,7 @@ app.add_middleware(MoesifMiddleware, settings=moesif_settings)
 client = MongoClient(os.environ.get("MONGO_URI"))
 events_db = client["events"]
 previous_events_db = client["previous_events"]
+tables_db = client["tables"]
 api_db = client["api_keys"]
 admin_db = client["admin_accounts"]
 
@@ -108,7 +109,7 @@ class Member(BaseModel):
 
 # Event registration helper functions
 def generate_slug(length=8):
-    """Generate a random slug for the event."""
+    """Generate a random slug for the table and event."""
     return secrets.token_urlsafe(length)
 
 
@@ -317,15 +318,15 @@ async def generate_tables(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
-@app.get("/api/admin/events")
-async def get_events(request: Request):
-    """Get all events from the database with all the sensitive data."""
+@app.get("/api/admin/tables")
+async def get_tables(request: Request):
+    """Get all tables from the database with all the sensitive data."""
     await check_api_key(request)
 
-    events = list(events_db.events.find({}, {"_id": 0}))
-    json_events = jsonable_encoder(events)
+    table = list(tables_db.tables.find({}, {"_id": 0}))
+    json_table = jsonable_encoder(table)
 
-    return JSONResponse(content=json_events)
+    return JSONResponse(content=json_table)
 
 
 @app.post("/api/admin/create_admin")
@@ -359,128 +360,124 @@ async def check_admin_credentials(credentials: AdminCredentials, request: Reques
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
-@app.get("/api/admin/event/{slug}")
-async def get_event(slug: str, request: Request):
-    """Get the event details from the database using the provided slug with sensitive data."""
+@app.get("/api/admin/table/{slug}")
+async def get_table(slug: str, request: Request):
+    """Get the table details from the database using the provided slug with sensitive data."""
     await check_api_key(request)
 
-    # Fetch the event from the database using the provided slug
-    event = events_db.events.find_one({"slug": slug}, {"_id": 0})
+    # Fetch the table from the database using the provided slug
+    table = tables_db.tables.find_one({"slug": slug}, {"_id": 0})
 
-    if event:
-        serialized_event = jsonable_encoder(
-            event
+    if table:
+        serialized_table = jsonable_encoder(
+            table
         )  # Convert non-serializable fields (like datetime)
-        return JSONResponse(content={"status": "success", "data": serialized_event})
+        return JSONResponse(content={"status": "success", "data": serialized_table})
 
-    # If the event is not found, raise a 404 error
-    raise HTTPException(status_code=404, detail="Event not found")
+    # If the table is not found, raise a 404 error
+    raise HTTPException(status_code=404, detail="Table not found")
 
 
-@app.post("/api/admin/event/{slug}")
-async def update_event(slug: str, request: Request):
-    """Update the event details using the provided slug."""
+@app.post("/api/admin/table/{slug}")
+async def update_table(slug: str, request: Request):
+    """Update the table details using the provided slug."""
     await check_api_key(request)
 
-    event = events_db.events.find_one({"slug": slug})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
 
     data = await request.json()
     update_data = {
-        "game_name": data.get("game_name", event["game_name"]),
-        "game_master": data.get("game_master", event["game_master"]),
-        "player_quota": int(data.get("player_quota", event["player_quota"])),
+        "game_name": data.get("game_name", table["game_name"]),
+        "game_master": data.get("game_master", table["game_master"]),
+        "player_quota": int(data.get("player_quota", table["player_quota"])),
         "total_joined_players": data.get(
-            "total_joined_players", event["total_joined_players"]
+            "total_joined_players", table["total_joined_players"]
         ),
-        "joined_players": data.get("joined_players", event["joined_players"]),
-        "slug": event["slug"],
-        "created_at": data.get("created_at", event["created_at"]),
+        "joined_players": data.get("joined_players", table["joined_players"]),
+        "slug": table["slug"],
+        "created_at": data.get("created_at", table["created_at"]),
     }
 
-    events_db.events.update_one({"slug": slug}, {"$set": update_data})
-    return JSONResponse(content={"message": "Event updated successfully"})
+    tables_db.tables.update_one({"slug": slug}, {"$set": update_data})
+    return JSONResponse(content={"message": "Table updated successfully"})
 
 
-@app.delete("/api/admin/event/{slug}")
-async def delete_event(slug: str, request: Request):
-    """Delete the event using the provided slug."""
+@app.delete("/api/admin/table/{slug}")
+async def delete_table(slug: str, request: Request):
+    """Delete the table using the provided slug."""
     await check_api_key(request)
 
-    # Find and delete the event by slug
-    previous_event = events_db.events.find_one({"slug": slug})
-    if previous_event:
-        previous_event["deleted_at"] = await fetch_current_datetime()
-        previous_events_db.events.insert_one(previous_event)
-    result = events_db.events.delete_one({"slug": slug})
+    # Find and delete the table by slug
+    result = tables_db.tables.delete_one({"slug": slug})
     if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Event not found")
+        raise HTTPException(status_code=404, detail="Table not found")
 
     # Return a success response
-    return JSONResponse(content={"message": "Event deleted successfully"})
+    return JSONResponse(content={"message": "Table deleted successfully"})
 
 
-@app.post("/api/admin/create_event")
-async def create_event(request: Request):
-    """Create a new event using the provided: game_name, game_master, player_quota."""
+@app.post("/api/admin/create_table")
+async def create_table(request: Request):
+    """Create a new table using the provided: game_name, game_master, player_quota."""
     await check_api_key(request)
 
-    # Parse the request body to get the event data
+    # Parse the request body to get the table data
     try:
-        event_data = await request.json()
+        table_data = await request.json()
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid request body")
 
-    # Create new event data
-    new_event = {
-        "game_name": event_data.get("game_name"),
-        "game_master": event_data.get("game_master"),
-        "player_quota": event_data.get("player_quota"),
+    # Create new table data
+    new_table = {
+        "game_name": table_data.get("game_name"),
+        "game_master": table_data.get("game_master"),
+        "player_quota": table_data.get("player_quota"),
         "total_joined_players": 0,
         "joined_players": [],
         "slug": generate_slug(),
         "created_at": await fetch_current_datetime(),
     }
 
-    # Insert the new event into the database
-    events_db.events.insert_one(new_event)
+    # Insert the new table into the database
+    tables_db.tables.insert_one(new_table)
 
-    # Return a success response with the event's slug
+    # Return a success response with the table's slug
     return JSONResponse(
-        content={"message": "Event created successfully", "slug": new_event["slug"]},
+        content={"message": "Table created successfully", "slug": new_table["slug"]},
         status_code=201,
     )
 
 
 @app.get("/api/admin/get_players/{slug}")
 async def get_players(slug: str, request: Request):
-    """Get the list of players for the event using the provided slug with sensitive data."""
+    """Get the list of players for the table using the provided slug, returns sensitive data."""
     await check_api_key(request)
 
-    event = events_db.events.find_one({"slug": slug}, {"_id": 0})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+    table = tables_db.tables.find_one({"slug": slug}, {"_id": 0})
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
 
-    return JSONResponse(content={"players": event.get("joined_players", [])})
+    return JSONResponse(content={"players": table.get("joined_players", [])})
 
 
 @app.post("/api/admin/add_player/{slug}")
 async def add_player(slug: str, player: Player, request: Request):
-    """Add a new player to the event using the provided slug."""
+    """Add a new player to the table using the provided slug."""
     await check_api_key(request)
 
-    event = events_db.events.find_one({"slug": slug})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
 
-    if event["total_joined_players"] >= event["player_quota"]:
-        raise HTTPException(status_code=400, detail="Event is full")
+    if table["total_joined_players"] >= table["player_quota"]:
+        raise HTTPException(status_code=400, detail="table is full")
 
     new_player = player.dict()
     new_player["registration_timestamp"] = await fetch_current_datetime()
 
-    events_db.events.update_one(
+    tables_db.tables.update_one(
         {"slug": slug},
         {
             "$push": {"joined_players": new_player},
@@ -495,10 +492,10 @@ async def add_player(slug: str, player: Player, request: Request):
 async def update_player(
     slug: str, student_id: str, player: PlayerUpdate, request: Request
 ):
-    """Update the player details for the event using the provided slug and student_id."""
+    """Update the player details for the table using the provided slug and student_id."""
     await check_api_key(request)
 
-    result = events_db.events.update_one(
+    result = tables_db.tables.update_one(
         {"slug": slug, "joined_players.student_id": student_id},
         {"$set": {"joined_players.$": player.dict()}},
     )
@@ -511,10 +508,10 @@ async def update_player(
 
 @app.delete("/api/admin/delete_player/{slug}/{student_id}")
 async def delete_player(slug: str, student_id: str, request: Request):
-    """Delete the player from the event using the provided slug and student_id."""
+    """Delete the player from the table using the provided slug and student_id."""
     await check_api_key(request)
 
-    result = events_db.events.update_one(
+    result = tables_db.tables.update_one(
         {"slug": slug},
         {
             "$pull": {"joined_players": {"student_id": student_id}},
@@ -533,45 +530,45 @@ async def delete_player(slug: str, student_id: str, request: Request):
 # These endpoints are for the users to interact with the event system, they don't return sensitive information.
 
 
-@app.get("/api/events")
-async def get_events(request: Request):
-    """Get all events from the database without sensitive data."""
-    events = list(
-        events_db.events.find({}, {"_id": 0, "joined_players": 0, "created_at": 0})
+@app.get("/api/tables")
+async def get_tables(request: Request):
+    """Get all tables from the database without sensitive data."""
+    tables = list(
+        tables_db.tables.find({}, {"_id": 0, "joined_players": 0, "created_at": 0})
     )
 
-    # Convert the events into JSON serializable format
-    json_events = jsonable_encoder(events)
+    # Convert the tables into JSON serializable format
+    json_tables = jsonable_encoder(tables)
 
-    return JSONResponse(content=json_events)
+    return JSONResponse(content=json_tables)
 
 
-@app.get("/api/event/{slug}")
-async def get_event(slug: str, request: Request):
-    """Get the event details from the database using the provided slug without sensitive data."""
-    # Fetch the event from the database using the provided slug
-    event = events_db.events.find_one(
+@app.get("/api/table/{slug}")
+async def get_table(slug: str, request: Request):
+    """Get the table details from the database using the provided slug without sensitive data."""
+    # Fetch the table from the database using the provided slug
+    table = tables_db.tables.find_one(
         {"slug": slug}, {"_id": 0, "joined_players": 0, "created_at": 0}
     )
 
-    if event:
-        serialized_event = jsonable_encoder(
-            event
+    if table:
+        serialized_table = jsonable_encoder(
+            table
         )  # Convert non-serializable fields (like datetime)
-        return JSONResponse(content={"status": "success", "data": serialized_event})
+        return JSONResponse(content={"status": "success", "data": serialized_table})
 
-    # If the event is not found, raise a 404 error
-    raise HTTPException(status_code=404, detail="Event not found")
+    # If the table is not found, raise a 404 error
+    raise HTTPException(status_code=404, detail="Table not found")
 
 
 @app.post("/api/register/{slug}")
-async def register_event(slug: str, player: Player):
-    """Register a player for the event using the provided slug."""
-    event = events_db.events.find_one({"slug": slug})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
+async def register_table(slug: str, player: Player):
+    """Register a player for the table using the provided slug."""
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
+        raise HTTPException(status_code=404, detail="table not found")
 
-    for existing_player in event.get("joined_players", []):
+    for existing_player in table.get("joined_players", []):
         if existing_player["student_id"] == player.student_id:
             raise HTTPException(status_code=400, detail="Student is already registered")
 
@@ -580,8 +577,8 @@ async def register_event(slug: str, player: Player):
             status_code=400, detail="Invalid student ID. Must be 8 digits."
         )
 
-    if event["total_joined_players"] >= event["player_quota"]:
-        raise HTTPException(status_code=400, detail="Event is full, no available seats")
+    if table["total_joined_players"] >= table["player_quota"]:
+        raise HTTPException(status_code=400, detail="table is full, no available seats")
 
     # Convert to dictionary and add registration timestamp
     new_player = player.dict()
@@ -589,7 +586,7 @@ async def register_event(slug: str, player: Player):
         datetime.now().isoformat()
     )  # Store as ISO string
 
-    events_db.events.update_one(
+    tables_db.tables.update_one(
         {"slug": slug},
         {
             "$push": {"joined_players": new_player},
