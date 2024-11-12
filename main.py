@@ -39,15 +39,14 @@ app = FastAPI()
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://events.emurpg.com"],  # https://events.emurpg.com
+    allow_origins=["https://events.emurpg.com"],  # PROD: https://events.emurpg.com
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.add_middleware(
-    MoesifMiddleware, settings=moesif_settings
-)  # Moesif middleware for API monitoring
+# Moesif middleware for API monitoring
+app.add_middleware(MoesifMiddleware, settings=moesif_settings)
 
 # MongoDB connection
 client = MongoClient(os.environ.get("MONGO_URI"))
@@ -64,6 +63,8 @@ for font_file in font_files:
 
 
 # Pydantic models
+
+
 class Player(BaseModel):
     name: str
     student_id: str
@@ -87,17 +88,12 @@ class Event(BaseModel):
     total_joined_players: int = 0
     joined_players: List[Player] = []
     slug: str
-    created_at: datetime
+    created_at: str
 
 
 class AdminCredentials(BaseModel):
     username: str
     hashedPassword: str
-    apiKey: str
-
-
-class ApiKeyCheck(BaseModel):
-    apiKey: str
 
 
 class Member(BaseModel):
@@ -107,12 +103,17 @@ class Member(BaseModel):
     game_played: Optional[str] = Field(default=None)
 
 
-# Helper functions from original backend
+# Helper functions #
+
+
+# Event registration helper functions
 def generate_slug(length=8):
+    """Generate a random slug for the event."""
     return secrets.token_urlsafe(length)
 
 
 def generate_api_key(length=32, owner=""):
+    """Generate a new API key for the given owner."""
     if owner == "":
         return "Owner name is required to generate an API key"
     new_api_key = secrets.token_urlsafe(length)
@@ -122,26 +123,51 @@ def generate_api_key(length=32, owner=""):
     return new_api_key
 
 
-def check_api_key(api_key: str):
-    try:
-        if api_key.startswith("{") and api_key.endswith("}"):
-            api_key_data = json.loads(api_key)
-            api_key = api_key_data.get("apiKey")
-    except json.JSONDecodeError:
-        pass
+async def check_api_key(request: Request):
+    """Check if the API key is valid and exists in the database."""
+    # Extract the "apiKey" header from the request
+    api_key_header = request.headers.get("apiKey")
 
+    if not api_key_header:
+        # Raise error if the API key header is missing
+        raise HTTPException(status_code=400, detail="Missing API Key.")
+
+    try:
+        # Attempt to parse the API key as JSON if it has { } format
+        if api_key_header.startswith("{") and api_key_header.endswith("}"):
+            api_key_data = json.loads(api_key_header)
+            api_key = api_key_data.get("apiKey")
+        else:
+            # Otherwise, assume it's a plain string
+            api_key = api_key_header
+    except json.JSONDecodeError:
+        # Fallback to treat as plain string if JSON parsing fails
+        api_key = api_key_header
+
+    # Check if the API key exists in the database
     status = api_db.api_keys.find_one({"api_key": api_key})
     if status:
-        current_time = datetime.now(timezone.utc)
+        # Update the usage time in the database
+        current_time = await fetch_current_datetime()
         api_db.api_keys.update_one(
             {"api_key": api_key}, {"$push": {"used_times": current_time}}
         )
         return True
-    return False
+
+    # Raise error if the API key is invalid
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def fetch_current_datetime():
+    """Fetch the current datetime from Time API in Cyprus timezone."""
+    return requests.get(
+        "https://timeapi.io/api/time/current/zone?timeZone=Europe%2FAthens"
+    ).json()["dateTime"]
 
 
 # Table generator helper functions
 def process_csv(file: UploadFile) -> List[Member]:
+    """Process the uploaded CSV file and return a list of Member objects."""
     content = file.file.read().decode("utf-8").splitlines()
     reader = csv.DictReader(content)
     employees = []
@@ -157,11 +183,13 @@ def process_csv(file: UploadFile) -> List[Member]:
 
 
 def fetch_image(url: str) -> BytesIO:
+    """Fetch an image from the given URL and return it as a BytesIO object."""
     response = requests.get(url)
     return BytesIO(response.content)
 
 
 def create_medieval_tables(employees: List[Member]) -> BytesIO:
+    """Create a medieval-themed table layout from the given list of employees."""
     managers = {}
     for emp in employees:
         if emp.is_manager:
@@ -262,19 +290,16 @@ def create_medieval_tables(employees: List[Member]) -> BytesIO:
     return img_buffer
 
 
-# New endpoint for table generation
+# Admin Endpoints #
+####################
+# These endpoints are for the admins to interact with the event system, they return sensitive information.
+
+
 @app.post("/api/admin/generate-tables")
 async def generate_tables(request: Request, file: UploadFile = File(...)):
+    """Generate medieval-themed tables from the uploaded CSV file."""
     # Validate API key
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
-
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    await check_api_key(request)
 
     # Validate file type
     if not file.filename.endswith(".csv"):
@@ -292,22 +317,10 @@ async def generate_tables(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
-def serialize_event(event):
-    """Convert non-serializable fields like datetime into strings"""
-    for key, value in event.items():
-        if isinstance(value, datetime):
-            event[key] = value.isoformat()  # Convert datetime to ISO string
-    return event
-
-
 @app.get("/api/admin/events")
 async def get_events(request: Request):
-    # Extract and validate the API key from the request header
-    api_key = request.headers.get("apiKey")
-
-    # Check if the API key is valid
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    """Get all events from the database with all the sensitive data."""
+    await check_api_key(request)
 
     events = list(events_db.events.find({}, {"_id": 0}))
     json_events = jsonable_encoder(events)
@@ -315,22 +328,10 @@ async def get_events(request: Request):
     return JSONResponse(content=json_events)
 
 
-@app.get("/api/events")
-async def get_events(request: Request):
-    events = list(
-        events_db.events.find({}, {"_id": 0, "joined_players": 0, "created_at": 0})
-    )
-
-    # Convert the events into JSON serializable format
-    json_events = jsonable_encoder(events)
-
-    return JSONResponse(content=json_events)
-
-
-@app.post("/api/create_admin")
-async def create_admin(credentials: AdminCredentials, api_key: str = Header(...)):
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+@app.post("/api/admin/create_admin")
+async def create_admin(credentials: AdminCredentials, request: Request):
+    """Create a new admin account with the provided credentials."""
+    await check_api_key(request)
 
     new_admin = {
         "username": credentials.username,
@@ -344,9 +345,9 @@ async def create_admin(credentials: AdminCredentials, api_key: str = Header(...)
 
 
 @app.post("/api/admin/checkcredentials")
-async def check_admin_credentials(credentials: AdminCredentials):
-    if not check_api_key(credentials.apiKey):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+async def check_admin_credentials(credentials: AdminCredentials, request: Request):
+    """Check if the provided admin credentials are correct."""
+    await check_api_key(request)
 
     admin_account = admin_db.admin_accounts.find_one({"username": credentials.username})
     if not admin_account:
@@ -358,18 +359,196 @@ async def check_admin_credentials(credentials: AdminCredentials):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
-@app.post("/api/admin/checkapikey")
-async def check_api_endpoint(api_key_check: ApiKeyCheck):
-    if check_api_key(api_key_check.apiKey):
-        print("API key is valid at check_api_endpoint")
-        return JSONResponse(content={"message": "API key is valid"})
-    else:
-        print("API key is invalid at check_api_endpoint")
-        raise HTTPException(status_code=401, detail="Invalid API key")
+@app.get("/api/admin/event/{slug}")
+async def get_event(slug: str, request: Request):
+    """Get the event details from the database using the provided slug with sensitive data."""
+    await check_api_key(request)
+
+    # Fetch the event from the database using the provided slug
+    event = events_db.events.find_one({"slug": slug}, {"_id": 0})
+
+    if event:
+        serialized_event = jsonable_encoder(
+            event
+        )  # Convert non-serializable fields (like datetime)
+        return JSONResponse(content={"status": "success", "data": serialized_event})
+
+    # If the event is not found, raise a 404 error
+    raise HTTPException(status_code=404, detail="Event not found")
+
+
+@app.post("/api/admin/event/{slug}")
+async def update_event(slug: str, request: Request):
+    """Update the event details using the provided slug."""
+    await check_api_key(request)
+
+    event = events_db.events.find_one({"slug": slug})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    data = await request.json()
+    update_data = {
+        "game_name": data.get("game_name", event["game_name"]),
+        "game_master": data.get("game_master", event["game_master"]),
+        "player_quota": int(data.get("player_quota", event["player_quota"])),
+        "total_joined_players": data.get(
+            "total_joined_players", event["total_joined_players"]
+        ),
+        "joined_players": data.get("joined_players", event["joined_players"]),
+        "slug": event["slug"],
+        "created_at": data.get("created_at", event["created_at"]),
+    }
+
+    events_db.events.update_one({"slug": slug}, {"$set": update_data})
+    return JSONResponse(content={"message": "Event updated successfully"})
+
+
+@app.delete("/api/admin/event/{slug}")
+async def delete_event(slug: str, request: Request):
+    """Delete the event using the provided slug."""
+    await check_api_key(request)
+
+    # Find and delete the event by slug
+    previous_event = events_db.events.find_one({"slug": slug})
+    if previous_event:
+        previous_event["deleted_at"] = await fetch_current_datetime()
+        previous_events_db.events.insert_one(previous_event)
+    result = events_db.events.delete_one({"slug": slug})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # Return a success response
+    return JSONResponse(content={"message": "Event deleted successfully"})
+
+
+@app.post("/api/admin/create_event")
+async def create_event(request: Request):
+    """Create a new event using the provided: game_name, game_master, player_quota."""
+    await check_api_key(request)
+
+    # Parse the request body to get the event data
+    try:
+        event_data = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+
+    # Create new event data
+    new_event = {
+        "game_name": event_data.get("game_name"),
+        "game_master": event_data.get("game_master"),
+        "player_quota": event_data.get("player_quota"),
+        "total_joined_players": 0,
+        "joined_players": [],
+        "slug": generate_slug(),
+        "created_at": await fetch_current_datetime(),
+    }
+
+    # Insert the new event into the database
+    events_db.events.insert_one(new_event)
+
+    # Return a success response with the event's slug
+    return JSONResponse(
+        content={"message": "Event created successfully", "slug": new_event["slug"]},
+        status_code=201,
+    )
+
+
+@app.get("/api/admin/get_players/{slug}")
+async def get_players(slug: str, request: Request):
+    """Get the list of players for the event using the provided slug with sensitive data."""
+    await check_api_key(request)
+
+    event = events_db.events.find_one({"slug": slug}, {"_id": 0})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return JSONResponse(content={"players": event.get("joined_players", [])})
+
+
+@app.post("/api/admin/add_player/{slug}")
+async def add_player(slug: str, player: Player, request: Request):
+    """Add a new player to the event using the provided slug."""
+    await check_api_key(request)
+
+    event = events_db.events.find_one({"slug": slug})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    if event["total_joined_players"] >= event["player_quota"]:
+        raise HTTPException(status_code=400, detail="Event is full")
+
+    new_player = player.dict()
+    new_player["registration_timestamp"] = await fetch_current_datetime()
+
+    events_db.events.update_one(
+        {"slug": slug},
+        {
+            "$push": {"joined_players": new_player},
+            "$inc": {"total_joined_players": 1},
+        },
+    )
+
+    return JSONResponse(content={"message": "Player added successfully"})
+
+
+@app.put("/api/admin/update_player/{slug}/{student_id}")
+async def update_player(
+    slug: str, student_id: str, player: PlayerUpdate, request: Request
+):
+    """Update the player details for the event using the provided slug and student_id."""
+    await check_api_key(request)
+
+    result = events_db.events.update_one(
+        {"slug": slug, "joined_players.student_id": student_id},
+        {"$set": {"joined_players.$": player.dict()}},
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    return JSONResponse(content={"message": "Player updated successfully"})
+
+
+@app.delete("/api/admin/delete_player/{slug}/{student_id}")
+async def delete_player(slug: str, student_id: str, request: Request):
+    """Delete the player from the event using the provided slug and student_id."""
+    await check_api_key(request)
+
+    result = events_db.events.update_one(
+        {"slug": slug},
+        {
+            "$pull": {"joined_players": {"student_id": student_id}},
+            "$inc": {"total_joined_players": -1},
+        },
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    return JSONResponse(content={"message": "Player deleted successfully"})
+
+
+# User Endpoints #
+####################
+# These endpoints are for the users to interact with the event system, they don't return sensitive information.
+
+
+@app.get("/api/events")
+async def get_events(request: Request):
+    """Get all events from the database without sensitive data."""
+    events = list(
+        events_db.events.find({}, {"_id": 0, "joined_players": 0, "created_at": 0})
+    )
+
+    # Convert the events into JSON serializable format
+    json_events = jsonable_encoder(events)
+
+    return JSONResponse(content=json_events)
 
 
 @app.get("/api/event/{slug}")
 async def get_event(slug: str, request: Request):
+    """Get the event details from the database using the provided slug without sensitive data."""
     # Fetch the event from the database using the provided slug
     event = events_db.events.find_one(
         {"slug": slug}, {"_id": 0, "joined_players": 0, "created_at": 0}
@@ -385,30 +564,9 @@ async def get_event(slug: str, request: Request):
     raise HTTPException(status_code=404, detail="Event not found")
 
 
-@app.get("/api/admin/event/{slug}")
-async def get_event(slug: str, request: Request):
-    # Extract and validate the API key from the request header
-    api_key = request.headers.get("apiKey")
-
-    # Check if the API key is valid
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # Fetch the event from the database using the provided slug
-    event = events_db.events.find_one({"slug": slug}, {"_id": 0})
-
-    if event:
-        serialized_event = jsonable_encoder(
-            event
-        )  # Convert non-serializable fields (like datetime)
-        return JSONResponse(content={"status": "success", "data": serialized_event})
-
-    # If the event is not found, raise a 404 error
-    raise HTTPException(status_code=404, detail="Event not found")
-
-
 @app.post("/api/register/{slug}")
 async def register_event(slug: str, player: Player):
+    """Register a player for the event using the provided slug."""
     event = events_db.events.find_one({"slug": slug})
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -442,253 +600,13 @@ async def register_event(slug: str, player: Player):
     return JSONResponse(content={"message": "Registration successful"})
 
 
-@app.post("/api/event/{slug}")
-async def update_event(slug: str, request: Request):
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
+# CHARROLLER (WIP - 11.12.24)#
+####################
+# These endpoints are for the character sheet processing using an LLM model (still testing).
+# Once done, these endpoints will give the following functionalities:
+## User can upload a D&D character sheet PDF, then the API will process it and return a modified roll list to be displayed in the frontend.
+## The roll list will include all basic D&D stats and skills, as well as any additional rolls based on the character sheet.
 
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    event = events_db.events.find_one({"slug": slug})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    data = await request.json()
-    update_data = {
-        "game_name": data.get("game_name", event["game_name"]),
-        "game_master": data.get("game_master", event["game_master"]),
-        "player_quota": int(data.get("player_quota", event["player_quota"])),
-        "total_joined_players": data.get(
-            "total_joined_players", event["total_joined_players"]
-        ),
-        "joined_players": data.get("joined_players", event["joined_players"]),
-        "slug": event["slug"],
-        "created_at": data.get("created_at", event["created_at"]),
-    }
-
-    events_db.events.update_one({"slug": slug}, {"$set": update_data})
-    return JSONResponse(content={"message": "Event updated successfully"})
-
-
-@app.delete("/api/admin/event/{slug}")
-async def delete_event(slug: str, request: Request):
-    # Extract and validate the API key from the request header
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
-
-    # Check if the API key is valid
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # Find and delete the event by slug
-    previous_events_db.events.insert_one(events_db.events.find_one({"slug": slug}))
-    result = events_db.events.delete_one({"slug": slug})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    # Return a success response
-    return JSONResponse(content={"message": "Event deleted successfully"})
-
-
-@app.post("/api/create_sample_event")
-async def create_sample_event(api_key: str = Header(...)):
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    sample_event = {
-        "game_name": "Sample Game",
-        "game_master": "Sample Master",
-        "player_quota": 5,
-        "joined_players": [
-            {
-                "student_id": "12312312",
-                "name": "baran",
-                "registration_timestamp": datetime(2024, 10, 15, 23, 14, 51, 546000),
-            },
-            {
-                "student_id": "12312313",
-                "name": "baran2",
-                "registration_timestamp": datetime(2024, 10, 15, 23, 14, 51, 546),
-            },
-            {
-                "student_id": "12312314",
-                "name": "baran3",
-                "registration_timestamp": datetime(2024, 10, 15, 23, 14, 51, 546),
-            },
-            {
-                "student_id": "12312315",
-                "name": "baran4",
-                "registration_timestamp": datetime(2024, 10, 15, 23, 14, 51, 546),
-            },
-        ],
-        "total_joined_players": 4,
-        "slug": generate_slug(),
-        "created_at": datetime(2024, 10, 9, 9, 17, 15, 683000),
-    }
-    events_db.events.insert_one(sample_event)
-    return JSONResponse(
-        content={
-            "message": "Sample event created successfully",
-            "slug": sample_event["slug"],
-        },
-        status_code=201,
-    )
-
-
-@app.post("/api/create_event")
-async def create_event(request: Request):
-    # Extract and validate the API key from the request header
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
-
-    # Check if the API key is valid
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    # Parse the request body to get the event data
-    try:
-        event_data = await request.json()
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid request body")
-
-    # Create new event data
-    new_event = {
-        "game_name": event_data.get("game_name"),
-        "game_master": event_data.get("game_master"),
-        "player_quota": event_data.get("player_quota"),
-        "total_joined_players": 0,
-        "joined_players": [],
-        "slug": generate_slug(),
-        "created_at": datetime.now(),
-    }
-
-    # Insert the new event into the database
-    events_db.events.insert_one(new_event)
-
-    # Return a success response with the event's slug
-    return JSONResponse(
-        content={"message": "Event created successfully", "slug": new_event["slug"]},
-        status_code=201,
-    )
-
-
-@app.get("/api/admin/get_players/{slug}")
-async def get_players(slug: str, request: Request):
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
-
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    event = events_db.events.find_one({"slug": slug}, {"_id": 0})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    return JSONResponse(content={"players": event.get("joined_players", [])})
-
-
-@app.post("/api/admin/add_player/{slug}")
-async def add_player(slug: str, player: Player, request: Request):
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
-
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    event = events_db.events.find_one({"slug": slug})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    if event["total_joined_players"] >= event["player_quota"]:
-        raise HTTPException(status_code=400, detail="Event is full")
-
-    new_player = player.dict()
-    new_player["registration_timestamp"] = datetime.now().isoformat()
-
-    events_db.events.update_one(
-        {"slug": slug},
-        {
-            "$push": {"joined_players": new_player},
-            "$inc": {"total_joined_players": 1},
-        },
-    )
-
-    return JSONResponse(content={"message": "Player added successfully"})
-
-
-@app.put("/api/admin/update_player/{slug}/{student_id}")
-async def update_player(
-    slug: str, student_id: str, player: PlayerUpdate, request: Request
-):
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
-
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    result = events_db.events.update_one(
-        {"slug": slug, "joined_players.student_id": student_id},
-        {"$set": {"joined_players.$": player.dict()}},
-    )
-
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Player not found")
-
-    return JSONResponse(content={"message": "Player updated successfully"})
-
-
-@app.delete("/api/admin/delete_player/{slug}/{student_id}")
-async def delete_player(slug: str, student_id: str, request: Request):
-    api_key_header = request.headers.get("apiKey")
-    try:
-        api_key_data = json.loads(api_key_header)
-        api_key = api_key_data.get("apiKey")
-    except (json.JSONDecodeError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid API key format")
-
-    if not check_api_key(api_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    result = events_db.events.update_one(
-        {"slug": slug},
-        {
-            "$pull": {"joined_players": {"student_id": student_id}},
-            "$inc": {"total_joined_players": -1},
-        },
-    )
-
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Player not found")
-
-    return JSONResponse(content={"message": "Player deleted successfully"})
-
-
-# CHARROLLER #
 from PyPDF2 import PdfReader
 from openai import OpenAI
 import re
@@ -700,6 +618,8 @@ client = OpenAI(
     base_url="https://api-inference.huggingface.co/v1/",
     api_key=os.environ.get("HUGGINGFACE_API_KEY"),
 )
+
+# Initialize constants for D&D character sheet processing
 
 DND_STATS = [
     "Strength",
@@ -717,6 +637,8 @@ DND_SKILLS = {
     "Wisdom": ["Animal Handling", "Insight", "Medicine", "Perception", "Survival"],
     "Charisma": ["Deception", "Intimidation", "Performance", "Persuasion"],
 }
+
+# Helper functions for character sheet processing
 
 
 def validate_and_format_dice(dice_str):
@@ -811,6 +733,7 @@ def ensure_basic_rolls(roll_list):
 
 @app.post("/api/charroller/process")
 async def process_character_sheet(file: UploadFile = File(...)):
+    """Process the D&D character sheet PDF and generate a modified roll list."""
     print("Starting character sheet processing")
     print(f"Received file: {file.filename}")
 
