@@ -1,5 +1,5 @@
 import json
-from fastapi import FastAPI, HTTPException, Request, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Depends
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -160,11 +160,35 @@ async def check_api_key(request: Request):
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+async def check_origin(request: Request):
+    """Check if the request origin is allowed (https://events.emurpg.com)."""
+    # Get the "Origin" header from the request
+    origin_header = request.headers.get("origin")
+    print(f"Got a {request.method} request from origin: {origin_header}")
+
+    allowed_origin = "https://events.emurpg.com"
+
+    # Check if the origin is missing or does not match the allowed origin
+    if origin_header != allowed_origin:
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid origin.")
+
+    return True  # Origin is valid, proceed with the request
+
+
 async def fetch_current_datetime():
     """Fetch the current datetime from Time API in Cyprus timezone."""
     return requests.get(
         "https://timeapi.io/api/time/current/zone?timeZone=Europe%2FAthens"
     ).json()["dateTime"]
+
+
+async def check_request(
+    request: Request, checkApiKey: bool = True, checkOrigin: bool = True
+):
+    if checkApiKey:
+        await check_api_key(request)
+    if checkOrigin:
+        await check_origin(request)
 
 
 # Table generator helper functions
@@ -300,8 +324,7 @@ def create_medieval_tables(employees: List[Member]) -> BytesIO:
 @app.post("/api/admin/generate-tables")
 async def generate_tables(request: Request, file: UploadFile = File(...)):
     """Generate medieval-themed tables from the uploaded CSV file."""
-    # Validate API key
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     # Validate file type
     if not file.filename.endswith(".csv"):
@@ -322,7 +345,7 @@ async def generate_tables(request: Request, file: UploadFile = File(...)):
 @app.get("/api/admin/tables")
 async def get_tables(request: Request):
     """Get all tables from the database with all the sensitive data."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = list(tables_db.tables.find({}, {"_id": 0}))
     json_table = jsonable_encoder(table)
@@ -333,7 +356,7 @@ async def get_tables(request: Request):
 @app.post("/api/admin/create_admin")
 async def create_admin(credentials: AdminCredentials, request: Request):
     """Create a new admin account with the provided credentials."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     new_admin = {
         "username": credentials.username,
@@ -349,7 +372,7 @@ async def create_admin(credentials: AdminCredentials, request: Request):
 @app.post("/api/admin/checkcredentials")
 async def check_admin_credentials(credentials: AdminCredentials, request: Request):
     """Check if the provided admin credentials are correct."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     admin_account = admin_db.admin_accounts.find_one({"username": credentials.username})
     if not admin_account:
@@ -364,7 +387,7 @@ async def check_admin_credentials(credentials: AdminCredentials, request: Reques
 @app.get("/api/admin/table/{slug}")
 async def get_table(slug: str, request: Request):
     """Get the table details from the database using the provided slug with sensitive data."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     # Fetch the table from the database using the provided slug
     table = tables_db.tables.find_one({"slug": slug}, {"_id": 0})
@@ -382,7 +405,7 @@ async def get_table(slug: str, request: Request):
 @app.post("/api/admin/table/{slug}")
 async def update_table(slug: str, request: Request):
     """Update the table details using the provided slug."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
     if not table:
@@ -408,7 +431,7 @@ async def update_table(slug: str, request: Request):
 @app.delete("/api/admin/table/{slug}")
 async def delete_table(slug: str, request: Request):
     """Delete the table using the provided slug."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     # Find and delete the table by slug
     result = tables_db.tables.delete_one({"slug": slug})
@@ -422,7 +445,7 @@ async def delete_table(slug: str, request: Request):
 @app.post("/api/admin/create_table")
 async def create_table(request: Request):
     """Create a new table using the provided: game_name, game_master, player_quota."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     # Parse the request body to get the table data
     try:
@@ -454,7 +477,7 @@ async def create_table(request: Request):
 @app.get("/api/admin/get_players/{slug}")
 async def get_players(slug: str, request: Request):
     """Get the list of players for the table using the provided slug, returns sensitive data."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug}, {"_id": 0})
     if not table:
@@ -466,7 +489,7 @@ async def get_players(slug: str, request: Request):
 @app.post("/api/admin/add_player/{slug}")
 async def add_player(slug: str, player: Player, request: Request):
     """Add a new player to the table using the provided slug."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
     if not table:
@@ -494,7 +517,7 @@ async def update_player(
     slug: str, student_id: str, player: PlayerUpdate, request: Request
 ):
     """Update the player details for the table using the provided slug and student_id."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     result = tables_db.tables.update_one(
         {"slug": slug, "joined_players.student_id": student_id},
@@ -510,7 +533,7 @@ async def update_player(
 @app.delete("/api/admin/delete_player/{slug}/{student_id}")
 async def delete_player(slug: str, student_id: str, request: Request):
     """Delete the player from the table using the provided slug and student_id."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     result = tables_db.tables.update_one(
         {"slug": slug},
@@ -532,10 +555,9 @@ async def delete_player(slug: str, student_id: str, request: Request):
 
 
 @app.get("/api/tables")
-async def get_tables(request: Request):
+async def get_tables(request: Request, dependencies=[Depends(check_origin)]):
     """Get all tables from the database without sensitive data."""
-    request_str = f"Method: {request.method}, URL: {request.url}, Headers: {dict(request.headers)}, Query Params: {dict(request.query_params)}"
-    print(f"got the request {request_str}")
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     tables = list(
         tables_db.tables.find({}, {"_id": 0, "joined_players": 0, "created_at": 0})
     )
@@ -549,6 +571,7 @@ async def get_tables(request: Request):
 @app.get("/api/table/{slug}")
 async def get_table(slug: str, request: Request):
     """Get the table details from the database using the provided slug without sensitive data."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     # Fetch the table from the database using the provided slug
     table = tables_db.tables.find_one(
         {"slug": slug}, {"_id": 0, "joined_players": 0, "created_at": 0}
@@ -565,8 +588,9 @@ async def get_table(slug: str, request: Request):
 
 
 @app.post("/api/register/{slug}")
-async def register_table(slug: str, player: Player):
+async def register_table(slug: str, player: Player, request: Request):
     """Register a player for the table using the provided slug."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     table = tables_db.tables.find_one({"slug": slug})
     if not table:
         raise HTTPException(status_code=404, detail="table not found")
@@ -732,8 +756,9 @@ def ensure_basic_rolls(roll_list):
 
 
 @app.post("/api/charroller/process")
-async def process_character_sheet(file: UploadFile = File(...)):
+async def process_character_sheet(request: Request, file: UploadFile = File(...)):
     """Process the D&D character sheet PDF and generate a modified roll list."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     print("Starting character sheet processing")
     print(f"Received file: {file.filename}")
 
