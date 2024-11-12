@@ -1,10 +1,10 @@
 import json
-from fastapi import FastAPI, HTTPException, Header, Request, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pymongo import MongoClient
-from datetime import datetime, timezone
+from datetime import datetime
 import secrets
 import os
 from hashlib import sha256
@@ -23,6 +23,7 @@ from moesifasgi import MoesifMiddleware
 load_dotenv()
 
 
+# API monitoring middleware helper function for Moesif
 async def custom_identify_user_id(request: Request, response: JSONResponse):
     return request.client.host
 
