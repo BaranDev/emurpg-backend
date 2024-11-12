@@ -39,7 +39,7 @@ app = FastAPI()
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # PROD: https://events.emurpg.com
+    allow_origins=["https://events.emurpg.com"],  # PROD: https://events.emurpg.com
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
