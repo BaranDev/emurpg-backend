@@ -1,9 +1,20 @@
 import json
-from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Depends
+from bson import ObjectId, Timestamp
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    File,
+    UploadFile,
+    Depends,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from datetime import datetime
 import secrets
 import os
@@ -19,6 +30,12 @@ import math
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
 from moesifasgi import MoesifMiddleware
+import asyncio
+from contextlib import asynccontextmanager
+from bson.json_util import default
+
+# Development mode flag
+DEV = False
 
 load_dotenv()
 
@@ -35,12 +52,99 @@ moesif_settings = {
     "IDENTIFY_USER": custom_identify_user_id,
 }
 
-app = FastAPI()
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# MongoDB connection
+ws_client = AsyncIOMotorClient(os.environ.get("MONGO_URI"))
+client = MongoClient(os.environ.get("MONGO_URI"))
+events_db = client["events"]
+previous_events_db = client["previous_events"]
+tables_db = client["tables"]
+ws_tables_db = ws_client["tables"]
+api_db = client["api_keys"]
+admin_db = client["admin_accounts"]
+
+# Lifespan context manager for MongoDB connection and WebSocket monitoring
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+
+manager = ConnectionManager()  # Connection manager instance
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await startup_tasks()
+        yield
+    finally:
+        await shutdown_tasks()
+
+
+async def startup_tasks():
+    asyncio.create_task(monitor_changes())
+
+
+async def shutdown_tasks():
+    for connection in manager.active_connections:
+        await connection.disconnect()
+    await ws_client.close()
+    await client.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+# Websocket helper functions
+
+
+async def monitor_changes():
+    """Monitor changes in the tables collection and broadcast them to all connected clients."""
+    try:
+        change_stream = ws_tables_db.tables.watch()
+        async for change in change_stream:
+            # Clean the change document before broadcasting
+            cleaned_change = json.loads(json.dumps(change, default=default))
+            await manager.broadcast({"message": "Records updated"})
+            print(f"Change broadcasted: {cleaned_change}")
+    except PyMongoError as e:
+        print(f"MongoDB change stream error: {e}")
+    finally:
+        await change_stream.close()
+
+
+# WebSocket Endpoints #
+
+
+@app.websocket("/ws/updates")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # Keep the connection alive
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+origins = ["*"] if DEV else ["https://events.emurpg.com"]
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://events.emurpg.com"],  # PROD: https://events.emurpg.com
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,14 +152,6 @@ app.add_middleware(
 
 # Moesif middleware for API monitoring
 app.add_middleware(MoesifMiddleware, settings=moesif_settings)
-
-# MongoDB connection
-client = MongoClient(os.environ.get("MONGO_URI"))
-events_db = client["events"]
-previous_events_db = client["previous_events"]
-tables_db = client["tables"]
-api_db = client["api_keys"]
-admin_db = client["admin_accounts"]
 
 # Add fonts
 font_dir = "resources/fonts"
@@ -127,6 +223,8 @@ def generate_api_key(length=32, owner=""):
 
 async def check_api_key(request: Request):
     """Check if the API key is valid and exists in the database."""
+    if DEV:
+        return True
     # Extract the "apiKey" header from the request
     api_key_header = request.headers.get("apiKey")
 
@@ -162,6 +260,8 @@ async def check_api_key(request: Request):
 
 async def check_origin(request: Request):
     """Check if the request origin is allowed (https://events.emurpg.com)."""
+    if DEV:
+        return True
     # Get the "Origin" header from the request
     origin_header = request.headers.get("origin")
     print(f"Got a {request.method} request from origin: {origin_header}")
