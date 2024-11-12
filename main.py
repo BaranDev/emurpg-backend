@@ -534,6 +534,8 @@ async def delete_player(slug: str, student_id: str, request: Request):
 @app.get("/api/tables")
 async def get_tables(request: Request):
     """Get all tables from the database without sensitive data."""
+    request_str = f"Method: {request.method}, URL: {request.url}, Headers: {dict(request.headers)}, Query Params: {dict(request.query_params)}"
+    print(f"got the request {request_str}")
     tables = list(
         tables_db.tables.find({}, {"_id": 0, "joined_players": 0, "created_at": 0})
     )
