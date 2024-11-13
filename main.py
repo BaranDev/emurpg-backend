@@ -199,6 +199,9 @@ class Member(BaseModel):
     is_manager: bool
     manager_name: Optional[str] = Field(default=None)
     game_played: Optional[str] = Field(default=None)
+    player_quota: Optional[int] = Field(
+        default=0
+    )  # Added player_quota for compatibility
 
 
 # Helper functions #
@@ -303,6 +306,7 @@ def process_csv(file: UploadFile) -> List[Member]:
             is_manager=bool(int(row["yonetici_mi"])),
             manager_name=row.get("birlikte_oynadigi_yonetici", ""),
             game_played=row.get("oynattigi_oyun", ""),
+            player_quota=int(row.get("player_quota", 0)),
         )
         employees.append(employee)
     return employees
@@ -317,44 +321,52 @@ def fetch_image(url: str) -> BytesIO:
 def create_medieval_tables(employees: List[Member]) -> BytesIO:
     """Create a medieval-themed table layout from the given list of employees."""
     managers = {}
+
+    # First pass: Create manager entries and gather team information
     for emp in employees:
         if emp.is_manager:
-            managers[emp.name] = {"game": emp.game_played or "Unknown", "team": []}
-        elif emp.manager_name:
-            if emp.manager_name not in managers:
-                managers[emp.manager_name] = {"game": "Unknown", "team": []}
-            managers[emp.manager_name]["team"].append(emp.name)
+            managers[emp.name] = {
+                "game": emp.game_played or "Unknown",
+                "team": [],
+                "quota": emp.player_quota,
+                "joined": 0,
+            }
+
+    # Second pass: Add team members and count joined players
+    for emp in employees:
+        if not emp.is_manager and emp.manager_name:
+            if emp.manager_name in managers:
+                managers[emp.manager_name]["team"].append(emp.name)
+                managers[emp.manager_name]["joined"] += 1
 
     table_count = len(managers)
+    if table_count == 0:
+        raise ValueError("No tables found in the provided data")
+
+    # Calculate layout dimensions
     cols = int(math.ceil(math.sqrt(table_count)))
     rows = int(math.ceil(table_count / cols))
     fig_width = cols * 5
     fig_height = rows * 4
 
+    # Create figure with medieval theme
     fig, ax = plt.subplots(figsize=(fig_width, fig_height), facecolor="#F2D2A9")
     ax.set_xlim(0, fig_width)
     ax.set_ylim(0, fig_height)
     ax.axis("off")
 
-    bg_image = fetch_image(
-        "https://raw.githubusercontent.com/BaranDev/BaranDev/refs/heads/main/hosted%20files/RECT_EMURPG%20DIGITAL%20BANNER.png"
-    )
-    ax.imshow(
-        plt.imread(bg_image),
-        extent=[0, fig_width, 0, fig_height],
-        aspect="auto",
-        alpha=0.7,
-    )
-
+    # Set up table dimensions and spacing
     table_width = 4.5
     table_height = 3.5
     gapsize = 0.15
-    table_groups_x_margin = 0.5
-    table_groups_y_margin = fig_height - 0.5
-    x = table_groups_x_margin
-    y = table_groups_y_margin
+    margin_x = 0.5
+    margin_y = fig_height - 0.5
+    x = margin_x
+    y = margin_y
 
+    # Draw tables
     for manager, data in managers.items():
+        # Create fancy box for table
         fancy_box = FancyBboxPatch(
             (x, y - table_height),
             table_width,
@@ -366,51 +378,78 @@ def create_medieval_tables(employees: List[Member]) -> BytesIO:
         )
         ax.add_patch(fancy_box)
 
+        # Add manager name
         ax.text(
             x + table_width / 2,
             y - 0.4,
             manager,
             ha="center",
             va="center",
-            fontweight="demibold",
+            fontweight="bold",
             fontsize=16,
             color="#8B4513",
             fontname="Cinzel",
         )
 
+        # Add game name and player count
         ax.text(
             x + table_width / 2,
             y - 0.8,
             f"{data['game']}",
             ha="center",
             va="center",
-            fontweight="extra bold",
-            fontsize=18,
+            fontweight="bold",
+            fontsize=14,
             color="#A0522D",
             fontname="Cinzel",
         )
 
-        for i, member in enumerate(data["team"]):
-            ax.text(
-                x + table_width / 2,
-                y - 1.2 - i * 0.3,
-                member,
-                ha="center",
-                va="center",
-                fontweight="roman",
-                fontsize=16,
-                color="#654321",
-                fontname="Cinzel",
-            )
+        # Add player count
+        ax.text(
+            x + table_width / 2,
+            y - 1.1,
+            f"Players: {data['joined']}/{data['quota'] if data['quota'] > 0 else '∞'}",
+            ha="center",
+            va="center",
+            fontsize=12,
+            color="#654321",
+            fontname="Cinzel",
+        )
 
+        # Add team members
+        for i, member in enumerate(data["team"]):
+            if i < 8:  # Limit to prevent overflow
+                ax.text(
+                    x + table_width / 2,
+                    y - 1.5 - i * 0.25,
+                    member,
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    color="#654321",
+                    fontname="Cinzel",
+                )
+            elif i == 8:
+                ax.text(
+                    x + table_width / 2,
+                    y - 1.5 - i * 0.25,
+                    f"+ {len(data['team']) - 8} more",
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    color="#654321",
+                    fontname="Cinzel",
+                )
+
+        # Move to next position
         x += table_width + gapsize
         if x + table_width > fig_width:
             y -= table_height + gapsize
-            x = table_groups_x_margin
+            x = margin_x
 
     plt.tight_layout()
     img_buffer = BytesIO()
-    plt.savefig(img_buffer, format="png", dpi=300, bbox_inches="tight", pad_inches=0)
+    plt.savefig(img_buffer, format="png", dpi=300, bbox_inches="tight", pad_inches=0.2)
     img_buffer.seek(0)
     plt.close(fig)
     return img_buffer
@@ -419,13 +458,10 @@ def create_medieval_tables(employees: List[Member]) -> BytesIO:
 # Admin Endpoints #
 ####################
 # These endpoints are for the admins to interact with the event system, they return sensitive information.
-
-
 @app.post("/api/admin/generate-tables")
 async def generate_tables(request: Request, file: UploadFile = File(...)):
     """Generate medieval-themed tables from the uploaded CSV file."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
-
     # Validate file type
     if not file.filename.endswith(".csv"):
         raise HTTPException(
