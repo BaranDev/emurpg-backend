@@ -1,10 +1,21 @@
 import json
-from fastapi import FastAPI, HTTPException, Header, Request, File, UploadFile
+from bson import ObjectId, Timestamp
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    File,
+    UploadFile,
+    Depends,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pymongo import MongoClient
-from datetime import datetime, timezone
+from pymongo.errors import PyMongoError
+from datetime import datetime
 import secrets
 import os
 from hashlib import sha256
@@ -19,10 +30,17 @@ import math
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
 from moesifasgi import MoesifMiddleware
+import asyncio
+from contextlib import asynccontextmanager
+from bson.json_util import default
+
+# Development mode flag
+DEV = False
 
 load_dotenv()
 
 
+# API monitoring middleware helper function for Moesif
 async def custom_identify_user_id(request: Request, response: JSONResponse):
     return request.client.host
 
@@ -34,12 +52,99 @@ moesif_settings = {
     "IDENTIFY_USER": custom_identify_user_id,
 }
 
-app = FastAPI()
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# MongoDB connection
+ws_client = AsyncIOMotorClient(os.environ.get("MONGO_URI"))
+client = MongoClient(os.environ.get("MONGO_URI"))
+events_db = client["events"]
+previous_events_db = client["previous_events"]
+tables_db = client["tables"]
+ws_tables_db = ws_client["tables"]
+api_db = client["api_keys"]
+admin_db = client["admin_accounts"]
+
+# Lifespan context manager for MongoDB connection and WebSocket monitoring
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+
+manager = ConnectionManager()  # Connection manager instance
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await startup_tasks()
+        yield
+    finally:
+        await shutdown_tasks()
+
+
+async def startup_tasks():
+    asyncio.create_task(monitor_changes())
+
+
+async def shutdown_tasks():
+    for connection in manager.active_connections:
+        await connection.disconnect()
+    await ws_client.close()
+    await client.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+# Websocket helper functions
+
+
+async def monitor_changes():
+    """Monitor changes in the tables collection and broadcast them to all connected clients."""
+    try:
+        change_stream = ws_tables_db.tables.watch()
+        async for change in change_stream:
+            # Clean the change document before broadcasting
+            cleaned_change = json.loads(json.dumps(change, default=default))
+            await manager.broadcast({"message": "Records updated"})
+            print(f"Change broadcasted: {cleaned_change}")
+    except PyMongoError as e:
+        print(f"MongoDB change stream error: {e}")
+    finally:
+        await change_stream.close()
+
+
+# WebSocket Endpoints #
+
+
+@app.websocket("/ws/updates")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # Keep the connection alive
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+origins = ["*"] if DEV else ["https://events.emurpg.com"]
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # PROD: https://events.emurpg.com
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,14 +152,6 @@ app.add_middleware(
 
 # Moesif middleware for API monitoring
 app.add_middleware(MoesifMiddleware, settings=moesif_settings)
-
-# MongoDB connection
-client = MongoClient(os.environ.get("MONGO_URI"))
-events_db = client["events"]
-previous_events_db = client["previous_events"]
-tables_db = client["tables"]
-api_db = client["api_keys"]
-admin_db = client["admin_accounts"]
 
 # Add fonts
 font_dir = "resources/fonts"
@@ -102,6 +199,9 @@ class Member(BaseModel):
     is_manager: bool
     manager_name: Optional[str] = Field(default=None)
     game_played: Optional[str] = Field(default=None)
+    player_quota: Optional[int] = Field(
+        default=0
+    )  # Added player_quota for compatibility
 
 
 # Helper functions #
@@ -126,6 +226,8 @@ def generate_api_key(length=32, owner=""):
 
 async def check_api_key(request: Request):
     """Check if the API key is valid and exists in the database."""
+    if DEV:
+        return True
     # Extract the "apiKey" header from the request
     api_key_header = request.headers.get("apiKey")
 
@@ -159,11 +261,37 @@ async def check_api_key(request: Request):
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+async def check_origin(request: Request):
+    """Check if the request origin is allowed (https://events.emurpg.com)."""
+    if DEV:
+        return True
+    # Get the "Origin" header from the request
+    origin_header = request.headers.get("origin")
+    print(f"Got a {request.method} request from origin: {origin_header}")
+
+    allowed_origin = "https://events.emurpg.com"
+
+    # Check if the origin is missing or does not match the allowed origin
+    if origin_header != allowed_origin:
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid origin.")
+
+    return True  # Origin is valid, proceed with the request
+
+
 async def fetch_current_datetime():
     """Fetch the current datetime from Time API in Cyprus timezone."""
     return requests.get(
         "https://timeapi.io/api/time/current/zone?timeZone=Europe%2FAthens"
     ).json()["dateTime"]
+
+
+async def check_request(
+    request: Request, checkApiKey: bool = True, checkOrigin: bool = True
+):
+    if checkApiKey:
+        await check_api_key(request)
+    if checkOrigin:
+        await check_origin(request)
 
 
 # Table generator helper functions
@@ -178,6 +306,7 @@ def process_csv(file: UploadFile) -> List[Member]:
             is_manager=bool(int(row["yonetici_mi"])),
             manager_name=row.get("birlikte_oynadigi_yonetici", ""),
             game_played=row.get("oynattigi_oyun", ""),
+            player_quota=int(row.get("player_quota", 0)),
         )
         employees.append(employee)
     return employees
@@ -192,44 +321,52 @@ def fetch_image(url: str) -> BytesIO:
 def create_medieval_tables(employees: List[Member]) -> BytesIO:
     """Create a medieval-themed table layout from the given list of employees."""
     managers = {}
+
+    # First pass: Create manager entries and gather team information
     for emp in employees:
         if emp.is_manager:
-            managers[emp.name] = {"game": emp.game_played or "Unknown", "team": []}
-        elif emp.manager_name:
-            if emp.manager_name not in managers:
-                managers[emp.manager_name] = {"game": "Unknown", "team": []}
-            managers[emp.manager_name]["team"].append(emp.name)
+            managers[emp.name] = {
+                "game": emp.game_played or "Unknown",
+                "team": [],
+                "quota": emp.player_quota,
+                "joined": 0,
+            }
+
+    # Second pass: Add team members and count joined players
+    for emp in employees:
+        if not emp.is_manager and emp.manager_name:
+            if emp.manager_name in managers:
+                managers[emp.manager_name]["team"].append(emp.name)
+                managers[emp.manager_name]["joined"] += 1
 
     table_count = len(managers)
+    if table_count == 0:
+        raise ValueError("No tables found in the provided data")
+
+    # Calculate layout dimensions
     cols = int(math.ceil(math.sqrt(table_count)))
     rows = int(math.ceil(table_count / cols))
     fig_width = cols * 5
     fig_height = rows * 4
 
+    # Create figure with medieval theme
     fig, ax = plt.subplots(figsize=(fig_width, fig_height), facecolor="#F2D2A9")
     ax.set_xlim(0, fig_width)
     ax.set_ylim(0, fig_height)
     ax.axis("off")
 
-    bg_image = fetch_image(
-        "https://raw.githubusercontent.com/BaranDev/BaranDev/refs/heads/main/hosted%20files/RECT_EMURPG%20DIGITAL%20BANNER.png"
-    )
-    ax.imshow(
-        plt.imread(bg_image),
-        extent=[0, fig_width, 0, fig_height],
-        aspect="auto",
-        alpha=0.7,
-    )
-
+    # Set up table dimensions and spacing
     table_width = 4.5
     table_height = 3.5
     gapsize = 0.15
-    table_groups_x_margin = 0.5
-    table_groups_y_margin = fig_height - 0.5
-    x = table_groups_x_margin
-    y = table_groups_y_margin
+    margin_x = 0.5
+    margin_y = fig_height - 0.5
+    x = margin_x
+    y = margin_y
 
+    # Draw tables
     for manager, data in managers.items():
+        # Create fancy box for table
         fancy_box = FancyBboxPatch(
             (x, y - table_height),
             table_width,
@@ -241,51 +378,78 @@ def create_medieval_tables(employees: List[Member]) -> BytesIO:
         )
         ax.add_patch(fancy_box)
 
+        # Add manager name
         ax.text(
             x + table_width / 2,
             y - 0.4,
             manager,
             ha="center",
             va="center",
-            fontweight="demibold",
+            fontweight="bold",
             fontsize=16,
             color="#8B4513",
             fontname="Cinzel",
         )
 
+        # Add game name and player count
         ax.text(
             x + table_width / 2,
             y - 0.8,
             f"{data['game']}",
             ha="center",
             va="center",
-            fontweight="extra bold",
-            fontsize=18,
+            fontweight="bold",
+            fontsize=14,
             color="#A0522D",
             fontname="Cinzel",
         )
 
-        for i, member in enumerate(data["team"]):
-            ax.text(
-                x + table_width / 2,
-                y - 1.2 - i * 0.3,
-                member,
-                ha="center",
-                va="center",
-                fontweight="roman",
-                fontsize=16,
-                color="#654321",
-                fontname="Cinzel",
-            )
+        # Add player count
+        ax.text(
+            x + table_width / 2,
+            y - 1.1,
+            f"Players: {data['joined']}/{data['quota'] if data['quota'] > 0 else '∞'}",
+            ha="center",
+            va="center",
+            fontsize=12,
+            color="#654321",
+            fontname="Cinzel",
+        )
 
+        # Add team members
+        for i, member in enumerate(data["team"]):
+            if i < 8:  # Limit to prevent overflow
+                ax.text(
+                    x + table_width / 2,
+                    y - 1.5 - i * 0.25,
+                    member,
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    color="#654321",
+                    fontname="Cinzel",
+                )
+            elif i == 8:
+                ax.text(
+                    x + table_width / 2,
+                    y - 1.5 - i * 0.25,
+                    f"+ {len(data['team']) - 8} more",
+                    ha="center",
+                    va="center",
+                    fontsize=12,
+                    color="#654321",
+                    fontname="Cinzel",
+                )
+
+        # Move to next position
         x += table_width + gapsize
         if x + table_width > fig_width:
             y -= table_height + gapsize
-            x = table_groups_x_margin
+            x = margin_x
 
     plt.tight_layout()
     img_buffer = BytesIO()
-    plt.savefig(img_buffer, format="png", dpi=300, bbox_inches="tight", pad_inches=0)
+    plt.savefig(img_buffer, format="png", dpi=300, bbox_inches="tight", pad_inches=0.2)
     img_buffer.seek(0)
     plt.close(fig)
     return img_buffer
@@ -294,14 +458,10 @@ def create_medieval_tables(employees: List[Member]) -> BytesIO:
 # Admin Endpoints #
 ####################
 # These endpoints are for the admins to interact with the event system, they return sensitive information.
-
-
 @app.post("/api/admin/generate-tables")
 async def generate_tables(request: Request, file: UploadFile = File(...)):
     """Generate medieval-themed tables from the uploaded CSV file."""
-    # Validate API key
-    await check_api_key(request)
-
+    await check_request(request, checkApiKey=True, checkOrigin=True)
     # Validate file type
     if not file.filename.endswith(".csv"):
         raise HTTPException(
@@ -321,7 +481,7 @@ async def generate_tables(request: Request, file: UploadFile = File(...)):
 @app.get("/api/admin/tables")
 async def get_tables(request: Request):
     """Get all tables from the database with all the sensitive data."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = list(tables_db.tables.find({}, {"_id": 0}))
     json_table = jsonable_encoder(table)
@@ -332,7 +492,7 @@ async def get_tables(request: Request):
 @app.post("/api/admin/create_admin")
 async def create_admin(credentials: AdminCredentials, request: Request):
     """Create a new admin account with the provided credentials."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     new_admin = {
         "username": credentials.username,
@@ -348,7 +508,7 @@ async def create_admin(credentials: AdminCredentials, request: Request):
 @app.post("/api/admin/checkcredentials")
 async def check_admin_credentials(credentials: AdminCredentials, request: Request):
     """Check if the provided admin credentials are correct."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     admin_account = admin_db.admin_accounts.find_one({"username": credentials.username})
     if not admin_account:
@@ -363,7 +523,7 @@ async def check_admin_credentials(credentials: AdminCredentials, request: Reques
 @app.get("/api/admin/table/{slug}")
 async def get_table(slug: str, request: Request):
     """Get the table details from the database using the provided slug with sensitive data."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     # Fetch the table from the database using the provided slug
     table = tables_db.tables.find_one({"slug": slug}, {"_id": 0})
@@ -381,7 +541,7 @@ async def get_table(slug: str, request: Request):
 @app.post("/api/admin/table/{slug}")
 async def update_table(slug: str, request: Request):
     """Update the table details using the provided slug."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
     if not table:
@@ -407,7 +567,7 @@ async def update_table(slug: str, request: Request):
 @app.delete("/api/admin/table/{slug}")
 async def delete_table(slug: str, request: Request):
     """Delete the table using the provided slug."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     # Find and delete the table by slug
     result = tables_db.tables.delete_one({"slug": slug})
@@ -421,7 +581,7 @@ async def delete_table(slug: str, request: Request):
 @app.post("/api/admin/create_table")
 async def create_table(request: Request):
     """Create a new table using the provided: game_name, game_master, player_quota."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     # Parse the request body to get the table data
     try:
@@ -453,7 +613,7 @@ async def create_table(request: Request):
 @app.get("/api/admin/get_players/{slug}")
 async def get_players(slug: str, request: Request):
     """Get the list of players for the table using the provided slug, returns sensitive data."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug}, {"_id": 0})
     if not table:
@@ -465,7 +625,7 @@ async def get_players(slug: str, request: Request):
 @app.post("/api/admin/add_player/{slug}")
 async def add_player(slug: str, player: Player, request: Request):
     """Add a new player to the table using the provided slug."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
     if not table:
@@ -493,7 +653,7 @@ async def update_player(
     slug: str, student_id: str, player: PlayerUpdate, request: Request
 ):
     """Update the player details for the table using the provided slug and student_id."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     result = tables_db.tables.update_one(
         {"slug": slug, "joined_players.student_id": student_id},
@@ -509,7 +669,7 @@ async def update_player(
 @app.delete("/api/admin/delete_player/{slug}/{student_id}")
 async def delete_player(slug: str, student_id: str, request: Request):
     """Delete the player from the table using the provided slug and student_id."""
-    await check_api_key(request)
+    await check_request(request, checkApiKey=True, checkOrigin=True)
 
     result = tables_db.tables.update_one(
         {"slug": slug},
@@ -531,8 +691,9 @@ async def delete_player(slug: str, student_id: str, request: Request):
 
 
 @app.get("/api/tables")
-async def get_tables(request: Request):
+async def get_tables(request: Request, dependencies=[Depends(check_origin)]):
     """Get all tables from the database without sensitive data."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     tables = list(
         tables_db.tables.find({}, {"_id": 0, "joined_players": 0, "created_at": 0})
     )
@@ -546,6 +707,7 @@ async def get_tables(request: Request):
 @app.get("/api/table/{slug}")
 async def get_table(slug: str, request: Request):
     """Get the table details from the database using the provided slug without sensitive data."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     # Fetch the table from the database using the provided slug
     table = tables_db.tables.find_one(
         {"slug": slug}, {"_id": 0, "joined_players": 0, "created_at": 0}
@@ -562,8 +724,9 @@ async def get_table(slug: str, request: Request):
 
 
 @app.post("/api/register/{slug}")
-async def register_table(slug: str, player: Player):
+async def register_table(slug: str, player: Player, request: Request):
     """Register a player for the table using the provided slug."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     table = tables_db.tables.find_one({"slug": slug})
     if not table:
         raise HTTPException(status_code=404, detail="table not found")
@@ -729,8 +892,9 @@ def ensure_basic_rolls(roll_list):
 
 
 @app.post("/api/charroller/process")
-async def process_character_sheet(file: UploadFile = File(...)):
+async def process_character_sheet(request: Request, file: UploadFile = File(...)):
     """Process the D&D character sheet PDF and generate a modified roll list."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
     print("Starting character sheet processing")
     print(f"Received file: {file.filename}")
 
