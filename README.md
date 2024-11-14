@@ -89,6 +89,6 @@ By combining these technologies and libraries, the EMU RPG API delivers a powerf
 The EMU RPG API is a backend service that uses modern technologies and methodologies to support the dynamic needs of the EMU RPG Club's website. It provides essential functionalities for managing game events, players, and character sheets, ensuring a seamless experience for both game masters and players.
 
 
-![GitHub release (latest by date)](https://img.shields.io/github/v/release/barandev/emurpg-backend)
-![GitHub](https://img.shields.io/github/license/barandev/emurpg-backend)
-![GitHub last commit](https://img.shields.io/github/last-commit/barandev/emurpg-backend)
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/barandev/emurpg-backend?style=for-the-badge)
+![GitHub License](https://img.shields.io/github/license/barandev/emurpg-backend?style=for-the-badge)
+![GitHub last commit](https://img.shields.io/github/last-commit/barandev/emurpg-backend?style=for-the-badge)
