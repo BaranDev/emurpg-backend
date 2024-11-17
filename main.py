@@ -35,7 +35,7 @@ from contextlib import asynccontextmanager
 from bson.json_util import default
 
 # Development mode flag
-DEV = True
+DEV = False
 
 load_dotenv()
 
