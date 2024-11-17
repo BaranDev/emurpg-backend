@@ -35,22 +35,10 @@ from contextlib import asynccontextmanager
 from bson.json_util import default
 
 # Development mode flag
-DEV = False
+DEV = True
 
 load_dotenv()
 
-
-# API monitoring middleware helper function for Moesif
-async def custom_identify_user_id(request: Request, response: JSONResponse):
-    return request.client.host
-
-
-moesif_settings = {
-    "APPLICATION_ID": os.environ.get("MOESIF_APPLICATION_ID"),
-    "LOG_BODY": True,
-    "CAPTURE_OUTGOING_REQUESTS": True,
-    "IDENTIFY_USER": custom_identify_user_id,
-}
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -150,7 +138,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Moesif middleware for API monitoring
+# Moesif middleware
+
+Moesif_enpoints_to_skip = ["/api/charroller/process", "/api/admin/generate-tables"]
+Moesif_content_types_to_skip = ["multipart/form-data"]
+
+
+# Custom skip function for file uploads
+async def custom_should_skip(request):
+    """Checks if request should skip processing. Returns True for file uploads and specific endpoints."""
+    if hasattr(request, "scope") and request.scope.get("_is_file_upload"):
+        return True
+
+    content_type = request.headers.get("content-type", "")
+    path = request.url.path
+    will_skip = any(ep in path for ep in Moesif_enpoints_to_skip) or any(
+        ct in content_type for ct in Moesif_content_types_to_skip
+    )
+    print(f"Will skip: {will_skip}")
+    return will_skip
+
+
+## Should skip check using async mode
+async def should_skip(request, response):
+    """Custom middleware function to determine if a request should skip certain processing."""
+    result = await custom_should_skip(request)
+    return result
+
+
+## Custom identify user function (if you want to track users)
+async def identify_user(request, response):
+    """Custom middleware function to identify the user from the request."""
+    return request.client.host if request else None
+
+
+## Moesif API settings
+moesif_settings = {
+    "APPLICATION_ID": os.environ.get("MOESIF_APPLICATION_ID"),
+    "LOG_BODY": False,
+    "DEBUG": False,
+    "IDENTIFY_USER": identify_user,
+    "SKIP": should_skip,
+    "CAPTURE_OUTGOING_REQUESTS": True,
+}
+
+## Add Moesif middleware to the app
 app.add_middleware(MoesifMiddleware, settings=moesif_settings)
 
 # Add fonts
@@ -772,6 +804,9 @@ from openai import OpenAI
 import re
 import json
 import os
+from llm import LLMHandler
+
+llm_handler = LLMHandler()
 
 # Initialize OpenAI client
 client = OpenAI(
@@ -779,142 +814,117 @@ client = OpenAI(
     api_key=os.environ.get("HUGGINGFACE_API_KEY"),
 )
 
-# Initialize constants for D&D character sheet processing
 
-DND_STATS = [
-    "Strength",
-    "Dexterity",
-    "Constitution",
-    "Intelligence",
-    "Wisdom",
-    "Charisma",
-]
-
-DND_SKILLS = {
-    "Strength": ["Athletics"],
-    "Dexterity": ["Acrobatics", "Sleight of Hand", "Stealth"],
-    "Intelligence": ["Arcana", "History", "Investigation", "Nature", "Religion"],
-    "Wisdom": ["Animal Handling", "Insight", "Medicine", "Perception", "Survival"],
-    "Charisma": ["Deception", "Intimidation", "Performance", "Persuasion"],
-}
-
-# Helper functions for character sheet processing
-
-
-def validate_and_format_dice(dice_str):
-    """Validate and format dice notation."""
-    print(f"Validating dice notation: {dice_str}")
-
-    # Remove any escape characters and extra spaces
-    dice_str = dice_str.strip().replace("\\", "")
-    print(f"Cleaned dice string: {dice_str}")
-
-    # Pattern for standard dice notation
-    dice_pattern = re.compile(r"^(\d+d\d+)?([+-]\d+)?$")
-    modifier_pattern = re.compile(r"^([A-Za-z]+\s+)?Modifier\s*([+-]\s*\d+)?$")
-
-    if dice_pattern.match(dice_str):
-        print(f"Standard dice notation found: {dice_str}")
-        return dice_str
-    elif modifier_pattern.match(dice_str):
-        print(f"Modifier notation found: {dice_str}")
-        mod_match = re.search(r"([+-]\s*\d+)", dice_str)
-        modifier = mod_match.group(1).replace(" ", "") if mod_match else "+0"
-        result = f"1d20{modifier}"
-        print(f"Converted to: {result}")
-        return result
-    else:
-        print(f"Non-standard notation, checking for compound dice: {dice_str}")
-        compound_pattern = re.compile(r"(\d+d\d+([+-]\d+)?)")
-        matches = compound_pattern.findall(dice_str)
-        if matches:
-            print(f"Found compound dice, using first match: {matches[0][0]}")
-            return matches[0][0]
-        print("No valid dice notation found, using default: 1d20+0")
-        return "1d20+0"
-
-
-def clean_json_response(response_text):
-    """Clean and parse JSON response from LLM."""
-    print("Starting JSON response cleaning")
-    print(f"Original response text: {response_text[:200]}...")  # Log first 200 chars
-
-    # Remove markdown code blocks
-    response_text = re.sub(r"```json\s*|\s*```", "", response_text)
-    print("Removed markdown code blocks")
-
-    # Remove escaped characters and normalize whitespace
-    response_text = response_text.replace("\\", "").strip()
-    print(f"Cleaned response text: {response_text}")
+def parse_llm_response(response_text: str) -> dict:
+    """Parses and cleans LLM response into valid JSON format"""
+    # Remove any markdown formatting or extra text
+    clean_text = (
+        re.sub(r"```json\s*|\s*```", "", response_text).replace("\\", "").strip()
+    )
 
     try:
-        json_data = json.loads(response_text)
-        print("Successfully parsed JSON directly")
-        return json_data
-    except json.JSONDecodeError as e:
-        print(f"Initial JSON parsing failed: {str(e)}")
-        print("Attempting to extract JSON using regex")
-
-        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        # Try to parse the JSON directly
+        return json.loads(clean_text)
+    except json.JSONDecodeError:
+        # If that fails, try to find JSON object in the text
+        json_match = re.search(r"\{.*\}", clean_text, re.DOTALL)
         if not json_match:
-            print("Could not extract JSON with regex")
-            raise ValueError("Could not extract valid JSON from model response")
-
-        extracted_json = json_match.group()
-        print(f"Extracted JSON: {extracted_json}...")
-        return json.loads(extracted_json)
+            raise ValueError("Invalid JSON response")
+        return json.loads(json_match.group())
 
 
-def ensure_basic_rolls(roll_list):
-    """Ensure all basic D&D stats and skills are included in the roll list."""
-    print("Checking for missing basic rolls")
-    print(f"Initial roll list size: {len(roll_list)}")
+def validate_roll_format(roll_list: list) -> list:
+    """
+    Validates roll format while preserving original values.
+    Only fixes obviously incorrect formats.
+    """
+    validated_rolls = []
+    dice_pattern = re.compile(r"^(\d+d\d+([+-]\d+)?|DC \d+)$")
 
-    existing_rolls = {roll["roll_name"].lower(): roll for roll in roll_list}
-    print(f"Existing roll names: {list(existing_rolls.keys())}")
+    for roll in roll_list:
+        roll_name = roll.get("roll_name", "").strip()
+        dice = roll.get("dice", "").strip()
 
-    # Add missing ability checks
-    for stat in DND_STATS:
-        check_name = f"{stat} Check"
-        if check_name.lower() not in existing_rolls:
-            print(f"Adding missing ability check: {check_name}")
-            roll_list.append({"roll_name": check_name, "dice": "1d20+0"})
+        # Skip empty or invalid rolls
+        if not roll_name or not dice:
+            continue
 
-    # Add missing skills
-    for ability, skills in DND_SKILLS.items():
-        for skill in skills:
-            if skill.lower() not in existing_rolls:
-                print(f"Adding missing skill: {skill}")
-                roll_list.append({"roll_name": skill, "dice": "1d20+0"})
+        # Only fix dice notation if it's clearly wrong
+        if not dice_pattern.match(dice) and not dice.startswith("DC "):
+            # Check if it's just missing the 'd'
+            if re.match(r"^\d+\d+([+-]\d+)?$", dice):
+                # Fix common format error (e.g., "120" -> "1d20")
+                dice = f"{dice[0]}d{dice[1:]}"
+            # If it has a bonus but no dice, assume 1d20
+            elif re.match(r"^[+-]\d+$", dice):
+                dice = f"1d20{dice}"
 
-    print(f"Final roll list size: {len(roll_list)}")
-    return roll_list
+        validated_rolls.append({"roll_name": roll_name, "dice": dice})
+
+    return validated_rolls
 
 
 @app.post("/api/charroller/process")
-async def process_character_sheet(request: Request, file: UploadFile = File(...)):
-    """Process the D&D character sheet PDF and generate a modified roll list."""
-    await check_request(request, checkApiKey=False, checkOrigin=True)
-    print("Starting character sheet processing")
-    print(f"Received file: {file.filename}")
+async def process_character_sheet(
+    file: UploadFile = File(...), request: Request = None
+):
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    print(f"Processing file: {file.filename}")
 
     try:
-        # Read PDF file content
-        print("Reading PDF file")
-        pdf_reader = PdfReader(file.file)
+        contents = await file.read()
+        pdf_file = BytesIO(contents)
+
+        if not file.filename.endswith(".pdf"):
+            raise HTTPException(
+                status_code=400, detail="Invalid file type. Please upload a PDF file."
+            )
+
+        pdf_reader = PdfReader(pdf_file)
         text_content = " ".join(
             page.extract_text().replace("\n", " ") for page in pdf_reader.pages
         )
-        print(f"Extracted text length: {len(text_content)} characters")
 
-        # Construct prompt
-        print("Constructing LLM prompt")
+        print(f"Extracted text length: {len(text_content)}")
+
         prompt = (
-            "You are an API endpoint that modifies and extends a base D&D character roll list. "
-            "Start with this base JSON and modify it based on the character sheet:\n\n"
+            "SYSTEM: You are a D&D 5E character sheet analyzer that extracts rolls and abilities. Your task is to:"
+            "\n1. Extract character name"
+            "\n2. Preserve all basic ability checks and skills"
+            "\n3. Add character-specific rolls by analyzing:"
+            "   - Weapon proficiencies and attack bonuses"
+            "   - Spell attack bonus and save DCs"
+            "   - Class features and special abilities"
+            "   - Racial traits"
+            "\n\nINPUT: D&D 5E character sheet text"
+            "\nOUTPUT: JSON with character_name and comprehensive roll_list\n\n"
+            "RULES FOR ROLL EXTRACTION:"
+            "\n- Attack rolls: Add proficiency + ability modifier"
+            "\n- Damage rolls: Include ability modifier and any bonuses"
+            "\n- Spell attacks: Use spell attack bonus"
+            "\n- Save DCs: Format as 'DC X [Type] Save'"
+            "\n- Class abilities: Include action type and resource cost"
+            "\n\nEXAMPLE OUTPUT:"
             """
             {
-                "character_name": "(Extracted from the sheet)",
+                "character_name": "Thorin Ironheart",
+                "roll_list": [
+                    {"roll_name": "Longsword Attack", "dice": "1d20+5"},
+                    {"roll_name": "Longsword Damage", "dice": "1d8+3"},
+                    {"roll_name": "Strength Check", "dice": "1d20+3"},
+                    {"roll_name": "Athletics", "dice": "1d20+5"},
+                    {"roll_name": "Fireball Damage", "dice": "8d6"},
+                    {"roll_name": "Spell Save DC", "dice": "DC 15"},
+                    {"roll_name": "Second Wind Healing", "dice": "1d10+3"},
+                    {"roll_name": "Initiative", "dice": "1d20+2"}
+                ]
+            }
+            """
+            "\n\nBASE TEMPLATE TO MODIFY (PRESERVE AND EXTEND):"
+            """{
+                "character_name": "(Extract from sheet)",
                 "roll_list": [
                     {"roll_name": "Attack", "dice": "NdM+X"},
                     {"roll_name": "Strength Check", "dice": "1d20+N"},
@@ -940,29 +950,38 @@ async def process_character_sheet(request: Request, file: UploadFile = File(...)
                     {"roll_name": "Deception", "dice": "1d20+N"},
                     {"roll_name": "Intimidation", "dice": "1d20+N"},
                     {"roll_name": "Performance", "dice": "1d20+N"},
-                    {"roll_name": "Persuasion", "dice": "1d20+N"},
-                    (CONTINUE WITH CHARACTER SPECIFIC ROLLS AFTER THIS!)
+                    {"roll_name": "Persuasion", "dice": "1d20+N"}
                 ]
-            }
-            """
-            "\n\nInstructions:"
-            "\n1. Update the character_name from the sheet"
-            "\n2. Update the modifiers for all existing rolls based on the character sheet"
-            "\n3. Add all saving throws with proper modifiers"
-            "\n4. Add all weapon attacks and damage rolls"
-            "\n5. Add all spell attacks and damage rolls"
-            "\n6. Add any special ability rolls"
-            "\n\nRules:"
-            "\n- Use only standard dice notation (e.g., '1d20+5', '2d6-1')"
-            "\n- Keep roll names short (1-4 words maximum)"
-            "\n- Do not add descriptions or extra text in roll names"
-            "\n- RETURN ONLY THE MODIFIED JSON WITH NO ADDITIONAL TEXT, DON'T USE JSON BLOCK RESPOND WITH PLAIN TEXT WITH JSON FORMAT!!"
-            f"\n\nAnalyze this character sheet and follow the instructions:\n{text_content}"
+            }"""
+            "\n\nKEY EXTRACTION PRIORITIES:"
+            "\n1. Character Name (required)"
+            "\n2. Basic Ability Checks (preserve existing)"
+            "\n3. Skill Checks (preserve existing)"
+            "\n4. Weapon Attacks:"
+            "\n   - Format: '[Weapon] Attack' (1d20 + attack bonus)"
+            "\n   - Format: '[Weapon] Damage' (weapon die + modifiers)"
+            "\n5. Spellcasting:"
+            "\n   - Format: '[Spell] Attack' (1d20 + spell attack)"
+            "\n   - Format: '[Spell] Damage' (spell damage dice)"
+            "\n   - Include save DCs"
+            "\n6. Class Features:"
+            "\n   - Format: '[Feature] Check' or '[Feature] Roll'"
+            "\n   - Include healing, bonus actions, reactions"
+            "\n7. Special Abilities:"
+            "\n   - Racial traits"
+            "\n   - Background features"
+            "\n   - Magic item abilities"
+            "\n\nFORMATTING RULES:"
+            "\n- Use standard dice notation: 'NdM+X' or 'NdM-X'"
+            "\n- Keep roll names clear and concise (1-4 words)"
+            "\n- Include all modifiers and bonuses"
+            "\n- No explanatory text or formatting"
+            "\n- Raw JSON output only"
+            "\n\nPROCESS THIS CHARACTER SHEET:"
+            f"\n{text_content}"
         )
-        print(f"Prompt length: {len(prompt)} characters")
 
-        # Get LLM response
-        print("Sending request to LLM")
+        # Process with LLM
         stream = client.chat.completions.create(
             model="meta-llama/Meta-Llama-3-8B-Instruct",
             messages=[{"role": "user", "content": prompt}],
@@ -971,32 +990,28 @@ async def process_character_sheet(request: Request, file: UploadFile = File(...)
             temperature=0.2,
         )
 
-        print("Processing LLM response stream")
-        response_text = ""
-        for chunk in stream:
-            if hasattr(chunk.choices[0].delta, "content"):
-                response_text += chunk.choices[0].delta.content
-        print(f"Received response length: {len(response_text)} characters")
-        print(f"Response preview: {response_text[:200]}...")
+        response_text = "".join(
+            chunk.choices[0].delta.content
+            for chunk in stream
+            if hasattr(chunk.choices[0].delta, "content")
+        )
 
-        # Clean and parse response
-        print("Cleaning and parsing JSON response")
-        response_json = clean_json_response(response_text)
-        print(f"Parsed JSON structure: {list(response_json.keys())}")
-        print(f"Roll list: \n{response_json}")
+        # Parse and validate response
+        response_json = parse_llm_response(response_text)
+        validated_rolls = validate_roll_format(response_json.get("roll_list", []))
 
         response_data = {
             "character_name": response_json.get("character_name", "Unknown"),
-            "roll_list": response_json.get("roll_list"),
+            "roll_list": validated_rolls,
         }
-        print("Successfully processed character sheet")
+
         return JSONResponse(content=response_data)
 
     except Exception as e:
-        print(f"Error processing character sheet: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Error processing character sheet: {str(e)}"
-        )
+        print(f"Error handling file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error handling file: {str(e)}")
+    finally:
+        await file.close()
 
 
 if __name__ == "__main__":
