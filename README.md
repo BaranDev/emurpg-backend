@@ -1,6 +1,6 @@
-# EMU RPG API
+# 🐲EMURPG API🐲
 
-API is hosted on https://api.emurpg.com
+>API is hosted on https://api.emurpg.com
 
 ## Overview
 
