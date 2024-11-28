@@ -211,7 +211,7 @@ class PlayerUpdate(BaseModel):
     contact: Optional[str] = None
 
 
-class Event(BaseModel):
+class Table(BaseModel):
     game_name: str
     game_master: str
     player_quota: int
@@ -234,6 +234,26 @@ class Member(BaseModel):
     player_quota: Optional[int] = Field(
         default=0
     )  # Added player_quota for compatibility
+
+
+# Add new Pydantic models
+class Event(BaseModel):
+    name: str
+    description: Optional[str]
+    start_date: str
+    end_date: str
+    is_ongoing: bool = True
+    total_tables: int = 0
+    tables: List[str] = []  # List of table slugs
+    slug: str
+    created_at: str
+
+
+class EventCreate(BaseModel):
+    name: str
+    description: Optional[str]
+    start_date: str
+    end_date: str
 
 
 # Helper functions #
@@ -490,6 +510,84 @@ def create_medieval_tables(employees: List[Member]) -> BytesIO:
 # Admin Endpoints #
 ####################
 # These endpoints are for the admins to interact with the event system, they return sensitive information.
+
+
+# New Admin Endpoints for Events
+@app.post("/api/admin/events")
+async def create_event(event: EventCreate, request: Request):
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    new_event = {
+        "name": event.name,
+        "description": event.description,
+        "start_date": event.start_date,
+        "end_date": event.end_date,
+        "is_ongoing": True,
+        "total_tables": 0,
+        "tables": [],
+        "slug": generate_slug(),
+        "created_at": await fetch_current_datetime(),
+    }
+
+    events_db.events.insert_one(new_event)
+    return JSONResponse(
+        content={"message": "Event created successfully", "slug": new_event["slug"]},
+        status_code=201,
+    )
+
+
+@app.get("/api/admin/events")
+async def get_admin_events(request: Request):
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    events = list(events_db.events.find({}, {"_id": 0}))
+    return JSONResponse(content=events)
+
+
+@app.put("/api/admin/events/{slug}/finish")
+async def finish_event(slug: str, request: Request):
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    event = events_db.events.find_one({"slug": slug})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # Get all tables for this event
+    tables = list(tables_db.tables.find({"event_slug": slug}))
+    for table in tables:
+        table.pop("_id", None)  # Remove MongoDB _id
+
+    # Update event with full table data and mark as finished
+    event["tables"] = tables
+    event["is_ongoing"] = False
+    event.pop("_id", None)
+
+    # Move to previous_events and cleanup
+    previous_events_db.events.insert_one(event)
+    events_db.events.delete_one({"slug": slug})
+    tables_db.tables.delete_many({"event_slug": slug})
+
+    return JSONResponse(content={"message": "Event finished and archived"})
+
+
+@app.delete("/api/admin/events/{slug}")
+async def delete_event(slug: str, request: Request):
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    event = events_db.events.find_one({"slug": slug})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    # Delete all tables associated with the event
+    tables_db.tables.delete_many({"event_slug": slug})
+
+    # Delete the event
+    events_db.events.delete_one({"slug": slug})
+    return JSONResponse(
+        content={"message": "Event and associated tables deleted successfully"}
+    )
+
+
 @app.post("/api/admin/generate-tables")
 async def generate_tables(request: Request, file: UploadFile = File(...)):
     """Generate medieval-themed tables from the uploaded CSV file."""
@@ -598,30 +696,36 @@ async def update_table(slug: str, request: Request):
 
 @app.delete("/api/admin/table/{slug}")
 async def delete_table(slug: str, request: Request):
-    """Delete the table using the provided slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
-    # Find and delete the table by slug
-    result = tables_db.tables.delete_one({"slug": slug})
-    if result.deleted_count == 0:
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
         raise HTTPException(status_code=404, detail="Table not found")
 
-    # Return a success response
+    # Remove table reference from event
+    events_db.events.update_one(
+        {"slug": table["event_slug"]},
+        {"$inc": {"total_tables": -1}, "$pull": {"tables": slug}},
+    )
+
+    tables_db.tables.delete_one({"slug": slug})
     return JSONResponse(content={"message": "Table deleted successfully"})
 
 
-@app.post("/api/admin/create_table")
-async def create_table(request: Request):
-    """Create a new table using the provided: game_name, game_master, player_quota."""
+@app.post("/api/admin/create_table/{event_slug}")
+async def create_table(event_slug: str, request: Request):
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
-    # Parse the request body to get the table data
-    try:
-        table_data = await request.json()
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid request body")
+    event = events_db.events.find_one({"slug": event_slug})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
 
-    # Create new table data
+    if not event["is_ongoing"]:
+        raise HTTPException(
+            status_code=400, detail="Cannot add tables to finished events"
+        )
+
+    table_data = await request.json()
     new_table = {
         "game_name": table_data.get("game_name"),
         "game_master": table_data.get("game_master"),
@@ -629,13 +733,17 @@ async def create_table(request: Request):
         "total_joined_players": 0,
         "joined_players": [],
         "slug": generate_slug(),
+        "event_slug": event_slug,
+        "event_name": event["name"],
         "created_at": await fetch_current_datetime(),
     }
 
-    # Insert the new table into the database
     tables_db.tables.insert_one(new_table)
+    events_db.events.update_one(
+        {"slug": event_slug},
+        {"$inc": {"total_tables": 1}, "$push": {"tables": new_table["slug"]}},
+    )
 
-    # Return a success response with the table's slug
     return JSONResponse(
         content={"message": "Table created successfully", "slug": new_table["slug"]},
         status_code=201,
@@ -720,6 +828,29 @@ async def delete_player(slug: str, student_id: str, request: Request):
 # User Endpoints #
 ####################
 # These endpoints are for the users to interact with the event system, they don't return sensitive information.
+
+
+@app.get("/api/events")
+async def get_events(request: Request):
+    await check_request(request, checkApiKey=False, checkOrigin=True)
+
+    # Only return ongoing events with non-sensitive data
+    events = list(
+        events_db.events.find(
+            {"is_ongoing": True},
+            {
+                "_id": 0,
+                "name": 1,
+                "description": 1,
+                "start_date": 1,
+                "end_date": 1,
+                "total_tables": 1,
+                "slug": 1,
+            },
+        )
+    )
+
+    return JSONResponse(content=events)
 
 
 @app.get("/api/tables")
