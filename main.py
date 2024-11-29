@@ -1,5 +1,4 @@
 import json
-from bson import ObjectId, Timestamp
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -21,12 +20,8 @@ import os
 from hashlib import sha256
 from pydantic import BaseModel, Field
 from typing import List, Optional
-import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch
-import csv
 from io import BytesIO
 import requests
-import math
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
 from moesifasgi import MoesifMiddleware
@@ -49,6 +44,7 @@ events_db = client["events"]
 previous_events_db = client["previous_events"]
 tables_db = client["tables"]
 ws_tables_db = ws_client["tables"]
+ws_events_db = ws_client["events"]
 api_db = client["api_keys"]
 admin_db = client["admin_accounts"]
 
@@ -84,7 +80,8 @@ async def lifespan(app: FastAPI):
 
 
 async def startup_tasks():
-    asyncio.create_task(monitor_changes())
+    asyncio.create_task(monitor_table_changes())
+    asyncio.create_task(monitor_event_changes())
 
 
 async def shutdown_tasks():
@@ -99,10 +96,25 @@ app = FastAPI(lifespan=lifespan)
 # Websocket helper functions
 
 
-async def monitor_changes():
+async def monitor_table_changes():
     """Monitor changes in the tables collection and broadcast them to all connected clients."""
     try:
         change_stream = ws_tables_db.tables.watch()
+        async for change in change_stream:
+            # Clean the change document before broadcasting
+            cleaned_change = json.loads(json.dumps(change, default=default))
+            await manager.broadcast({"message": "Records updated"})
+            print(f"Change broadcasted: {cleaned_change}")
+    except PyMongoError as e:
+        print(f"MongoDB change stream error: {e}")
+    finally:
+        await change_stream.close()
+
+
+async def monitor_event_changes():
+    """Monitor changes in the events collection and broadcast them to all connected clients."""
+    try:
+        change_stream = ws_events_db.events.watch()
         async for change in change_stream:
             # Clean the change document before broadcasting
             cleaned_change = json.loads(json.dumps(change, default=default))
@@ -346,164 +358,170 @@ async def check_request(
         await check_origin(request)
 
 
-# Table generator helper functions
-def process_csv(file: UploadFile) -> List[Member]:
-    """Process the uploaded CSV file and return a list of Member objects."""
-    content = file.file.read().decode("utf-8").splitlines()
-    reader = csv.DictReader(content)
-    employees = []
-    for row in reader:
-        employee = Member(
-            name=row["isim"],
-            is_manager=bool(int(row["yonetici_mi"])),
-            manager_name=row.get("birlikte_oynadigi_yonetici", ""),
-            game_played=row.get("oynattigi_oyun", ""),
-            player_quota=int(row.get("player_quota", 0)),
-        )
-        employees.append(employee)
-    return employees
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
+from pathlib import Path
 
 
-def fetch_image(url: str) -> BytesIO:
-    """Fetch an image from the given URL and return it as a BytesIO object."""
-    response = requests.get(url)
-    return BytesIO(response.content)
+def create_event_announcement(event_slug: str) -> BytesIO:
+    """Create a medieval-themed announcement image with enhanced graphics."""
+    event = events_db.events.find_one({"slug": event_slug})
+    if not event:
+        raise ValueError("Event not found")
 
+    if isinstance(event["tables"], list) and all(
+        isinstance(x, str) for x in event["tables"]
+    ):
+        tables = list(tables_db.tables.find({"event_slug": event_slug}))
+    else:
+        tables = event["tables"]
 
-def create_medieval_tables(employees: List[Member]) -> BytesIO:
-    """Create a medieval-themed table layout from the given list of employees."""
-    managers = {}
+    # Image dimensions and colors
+    WIDTH = 1920
+    HEIGHT = max(1080, 600 + (len(tables) * 200))  # Base height plus 200px per table
+    BACKGROUND = (44, 24, 16)  # Deep brown
+    BORDER_COLOR = (139, 69, 19)  # Saddle brown
+    TEXT_COLOR = (255, 215, 0)  # Gold
+    HEADER_COLOR = (255, 223, 0)  # Bright gold
+    TABLE_BG = (59, 36, 23)  # Darker brown
 
-    # First pass: Create manager entries and gather team information
-    for emp in employees:
-        if emp.is_manager:
-            managers[emp.name] = {
-                "game": emp.game_played or "Unknown",
-                "team": [],
-                "quota": emp.player_quota,
-                "joined": 0,
-            }
+    def calculate_table_height(table):
+        num_players = len(table.get("joined_players", []))
+        return max(300, 160 + (num_players * 65))
 
-    # Second pass: Add team members and count joined players
-    for emp in employees:
-        if not emp.is_manager and emp.manager_name:
-            if emp.manager_name in managers:
-                managers[emp.manager_name]["team"].append(emp.name)
-                managers[emp.manager_name]["joined"] += 1
+    # Create base image
+    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
+    draw = ImageDraw.Draw(img)
 
-    table_count = len(managers)
-    if table_count == 0:
-        raise ValueError("No tables found in the provided data")
+    # Load fonts
+    font_path = "resources/fonts/Cinzel-Regular.ttf"
+    bold_font_path = "resources/fonts/Cinzel-Bold.ttf"
+    header_font = ImageFont.truetype(bold_font_path, 120)
+    date_font = ImageFont.truetype(font_path, 60)
+    table_header_font = ImageFont.truetype(bold_font_path, 70)
+    gm_font = ImageFont.truetype(font_path, 65)
+    player_font = ImageFont.truetype(font_path, 40)
+    footer_font = ImageFont.truetype(font_path, 50)
 
-    # Calculate layout dimensions
-    cols = int(math.ceil(math.sqrt(table_count)))
-    rows = int(math.ceil(table_count / cols))
-    fig_width = cols * 5
-    fig_height = rows * 4
+    # Draw main border
+    border_width = 8
+    draw.rectangle(
+        [(border_width, border_width), (WIDTH - border_width, HEIGHT - border_width)],
+        outline=BORDER_COLOR,
+        width=border_width,
+    )
 
-    # Create figure with medieval theme
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height), facecolor="#F2D2A9")
-    ax.set_xlim(0, fig_width)
-    ax.set_ylim(0, fig_height)
-    ax.axis("off")
+    # Draw event header
+    header_text = event["name"].upper()
+    header_bbox = draw.textbbox((0, 0), header_text, font=header_font)
+    header_width = header_bbox[2] - header_bbox[0]
+    draw.text(
+        ((WIDTH - header_width) // 2, 50), header_text, HEADER_COLOR, font=header_font
+    )
 
-    # Set up table dimensions and spacing
-    table_width = 4.5
-    table_height = 3.5
-    gapsize = 0.15
-    margin_x = 0.5
-    margin_y = fig_height - 0.5
-    x = margin_x
-    y = margin_y
+    # Draw date
+    start_date = event["start_date"]
+    end_date = event["end_date"]
+    date_text = start_date if start_date == end_date else f"{start_date} - {end_date}"
+    date_bbox = draw.textbbox((0, 0), date_text, font=date_font)
+    date_width = date_bbox[2] - date_bbox[0]
+    draw.text(((WIDTH - date_width) // 2, 180), date_text, TEXT_COLOR, font=date_font)
+
+    # Table layout calculations
+    table_margin = 40
+    table_padding = 30
+    cols = min(3, len(tables))
+    rows = (len(tables) + cols - 1) // cols
+    table_width = (WIDTH - (table_margin * (cols + 1))) // cols
+    start_y = 300
+
+    # Calculate row heights
+    max_height_per_row = []
+    for row in range(rows):
+        row_heights = []
+        for col in range(cols):
+            idx = row * cols + col
+            if idx < len(tables):
+                height = calculate_table_height(tables[idx])
+                row_heights.append(height)
+        max_height_per_row.append(max(row_heights) if row_heights else 0)
 
     # Draw tables
-    for manager, data in managers.items():
-        # Create fancy box for table
-        fancy_box = FancyBboxPatch(
-            (x, y - table_height),
-            table_width,
-            table_height,
-            boxstyle="round,pad=0.02,rounding_size=0.02",
-            ec=(0.4, 0.2, 0.0),
-            fc=(0.9, 0.8, 0.7),
-            alpha=0.8,
-        )
-        ax.add_patch(fancy_box)
+    current_y = start_y
+    for row in range(rows):
+        for col in range(cols):
+            idx = row * cols + col
+            if idx >= len(tables):
+                continue
 
-        # Add manager name
-        ax.text(
-            x + table_width / 2,
-            y - 0.4,
-            manager,
-            ha="center",
-            va="center",
-            fontweight="bold",
-            fontsize=16,
-            color="#8B4513",
-            fontname="Cinzel",
-        )
+            table = tables[idx]
+            x = table_margin + (col * (table_width + table_margin))
+            y = current_y
+            table_height = max_height_per_row[row]
 
-        # Add game name and player count
-        ax.text(
-            x + table_width / 2,
-            y - 0.8,
-            f"{data['game']}",
-            ha="center",
-            va="center",
-            fontweight="bold",
-            fontsize=14,
-            color="#A0522D",
-            fontname="Cinzel",
-        )
+            # Table background
+            draw.rounded_rectangle(
+                [(x, y), (x + table_width, y + table_height)],
+                radius=20,
+                fill=TABLE_BG,
+                outline=BORDER_COLOR,
+                width=3,
+            )
 
-        # Add player count
-        ax.text(
-            x + table_width / 2,
-            y - 1.1,
-            f"Players: {data['joined']}/{data['quota'] if data['quota'] > 0 else '∞'}",
-            ha="center",
-            va="center",
-            fontsize=12,
-            color="#654321",
-            fontname="Cinzel",
-        )
+            # Game name
+            game_text = table["game_name"].upper()
+            game_bbox = draw.textbbox((0, 0), game_text, font=table_header_font)
+            game_width = game_bbox[2] - game_bbox[0]
+            draw.text(
+                (x + (table_width - game_width) // 2, y + 20),
+                game_text,
+                TEXT_COLOR,
+                font=table_header_font,
+            )
 
-        # Add team members
-        for i, member in enumerate(data["team"]):
-            if i < 8:  # Limit to prevent overflow
-                ax.text(
-                    x + table_width / 2,
-                    y - 1.5 - i * 0.25,
-                    member,
-                    ha="center",
-                    va="center",
-                    fontsize=12,
-                    color="#654321",
-                    fontname="Cinzel",
+            # Game Master
+            gm_text = f"{table['game_master']}"
+            gm_bbox = draw.textbbox((0, 0), gm_text, font=gm_font)
+            gm_width = gm_bbox[2] - gm_bbox[0]
+            draw.text(
+                (x + (table_width - gm_width) // 2, y + 100),
+                gm_text,
+                TEXT_COLOR,
+                font=gm_font,
+            )
+
+            # Players
+            players = [p["name"].upper() for p in table.get("joined_players", [])]
+            player_y = y + 160
+            player_y = y + 200  # Increased from 160
+            for player in players:
+                player_bbox = draw.textbbox((0, 0), player, font=player_font)
+                player_width = player_bbox[2] - player_bbox[0]
+                draw.text(
+                    (x + (table_width - player_width) // 2, player_y),
+                    player,
+                    TEXT_COLOR,
+                    font=player_font,
                 )
-            elif i == 8:
-                ax.text(
-                    x + table_width / 2,
-                    y - 1.5 - i * 0.25,
-                    f"+ {len(data['team']) - 8} more",
-                    ha="center",
-                    va="center",
-                    fontsize=12,
-                    color="#654321",
-                    fontname="Cinzel",
-                )
+                player_y += 50
 
-        # Move to next position
-        x += table_width + gapsize
-        if x + table_width > fig_width:
-            y -= table_height + gapsize
-            x = margin_x
+        current_y += max_height_per_row[row] + table_margin
 
-    plt.tight_layout()
+    # Footer with dice
+    footer_text = "EMU RPG CLUB"
+    footer_bbox = draw.textbbox((0, 0), footer_text, font=footer_font)
+    footer_width = footer_bbox[2] - footer_bbox[0]
+    footer_x = (WIDTH - footer_width) // 2
+    footer_y = HEIGHT - 80
+
+    # Draw footer text
+    draw.text((footer_x, footer_y), footer_text, TEXT_COLOR, font=footer_font)
+
+    # Save image
     img_buffer = BytesIO()
-    plt.savefig(img_buffer, format="png", dpi=300, bbox_inches="tight", pad_inches=0.2)
+    img.save(img_buffer, format="PNG", quality=95)
     img_buffer.seek(0)
-    plt.close(fig)
+
     return img_buffer
 
 
@@ -524,9 +542,11 @@ async def create_event(event: EventCreate, request: Request):
         "end_date": event.end_date,
         "is_ongoing": True,
         "total_tables": 0,
+        "available_tables": 0,
         "tables": [],
         "slug": generate_slug(),
         "created_at": await fetch_current_datetime(),
+        "available_seats": 0,
     }
 
     events_db.events.insert_one(new_event)
@@ -586,26 +606,6 @@ async def delete_event(slug: str, request: Request):
     return JSONResponse(
         content={"message": "Event and associated tables deleted successfully"}
     )
-
-
-@app.post("/api/admin/generate-tables")
-async def generate_tables(request: Request, file: UploadFile = File(...)):
-    """Generate medieval-themed tables from the uploaded CSV file."""
-    await check_request(request, checkApiKey=True, checkOrigin=True)
-    # Validate file type
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(
-            status_code=400, detail="Invalid file type. Please upload a CSV file."
-        )
-
-    try:
-        employees = process_csv(file)
-        if not employees:
-            raise ValueError("No valid data found in the CSV file.")
-        img_buffer = create_medieval_tables(employees)
-        return StreamingResponse(img_buffer, media_type="image/png")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
 @app.get("/api/admin/tables")
@@ -670,7 +670,6 @@ async def get_table(slug: str, request: Request):
 
 @app.post("/api/admin/table/{slug}")
 async def update_table(slug: str, request: Request):
-    """Update the table details using the provided slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
@@ -678,19 +677,37 @@ async def update_table(slug: str, request: Request):
         raise HTTPException(status_code=404, detail="Table not found")
 
     data = await request.json()
+    old_quota = int(table["player_quota"])
+    old_joined = int(table["total_joined_players"])
+    new_quota = int(data.get("player_quota", old_quota))
+    new_joined = int(data.get("total_joined_players", old_joined))
+
     update_data = {
         "game_name": data.get("game_name", table["game_name"]),
         "game_master": data.get("game_master", table["game_master"]),
-        "player_quota": int(data.get("player_quota", table["player_quota"])),
-        "total_joined_players": data.get(
-            "total_joined_players", table["total_joined_players"]
-        ),
+        "player_quota": new_quota,
+        "total_joined_players": new_joined,
         "joined_players": data.get("joined_players", table["joined_players"]),
         "slug": table["slug"],
         "created_at": data.get("created_at", table["created_at"]),
     }
 
+    # Calculate seat changes
+    old_available = old_quota - old_joined
+    new_available = new_quota - new_joined
+    seat_difference = new_quota - old_quota
+
+    # Update tables collection
     tables_db.tables.update_one({"slug": slug}, {"$set": update_data})
+
+    update_fields = {"available_seats": new_quota - old_quota}
+    if old_available > 0 and new_available <= 0:
+        update_fields["available_tables"] = -1
+    elif old_available <= 0 and new_available > 0:
+        update_fields["available_tables"] = 1
+
+    events_db.events.update_one({"slug": table["event_slug"]}, {"$inc": update_fields})
+
     return JSONResponse(content={"message": "Table updated successfully"})
 
 
@@ -702,10 +719,18 @@ async def delete_table(slug: str, request: Request):
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
 
-    # Remove table reference from event
+    remaining_seats = int(table["player_quota"]) - int(table["total_joined_players"])
+
     events_db.events.update_one(
         {"slug": table["event_slug"]},
-        {"$inc": {"total_tables": -1}, "$pull": {"tables": slug}},
+        {
+            "$inc": {
+                "total_tables": -1,
+                "available_tables": -1 if remaining_seats > 0 else 0,
+                "available_seats": -remaining_seats,
+            },
+            "$pull": {"tables": slug},
+        },
     )
 
     tables_db.tables.delete_one({"slug": slug})
@@ -726,10 +751,12 @@ async def create_table(event_slug: str, request: Request):
         )
 
     table_data = await request.json()
+    player_quota = int(table_data.get("player_quota", 0))
+
     new_table = {
         "game_name": table_data.get("game_name"),
         "game_master": table_data.get("game_master"),
-        "player_quota": table_data.get("player_quota"),
+        "player_quota": player_quota,
         "total_joined_players": 0,
         "joined_players": [],
         "slug": generate_slug(),
@@ -739,9 +766,17 @@ async def create_table(event_slug: str, request: Request):
     }
 
     tables_db.tables.insert_one(new_table)
+
     events_db.events.update_one(
         {"slug": event_slug},
-        {"$inc": {"total_tables": 1}, "$push": {"tables": new_table["slug"]}},
+        {
+            "$inc": {
+                "total_tables": 1,
+                "available_tables": 1,
+                "available_seats": player_quota,
+            },
+            "$push": {"tables": new_table["slug"]},
+        },
     )
 
     return JSONResponse(
@@ -768,6 +803,7 @@ async def add_player(slug: str, player: Player, request: Request):
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
+    event = events_db.events.find_one({"slug": table["event_slug"]})
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
 
@@ -777,6 +813,9 @@ async def add_player(slug: str, player: Player, request: Request):
     new_player = player.dict()
     new_player["registration_timestamp"] = await fetch_current_datetime()
 
+    remaining_seats = int(table["player_quota"]) - (
+        int(table["total_joined_players"]) + 1
+    )
     tables_db.tables.update_one(
         {"slug": slug},
         {
@@ -784,6 +823,11 @@ async def add_player(slug: str, player: Player, request: Request):
             "$inc": {"total_joined_players": 1},
         },
     )
+    update_fields = {"available_seats": -1}
+    if remaining_seats == 0:
+        update_fields["available_tables"] = -1
+
+    events_db.events.update_one({"slug": table["event_slug"]}, {"$inc": update_fields})
 
     return JSONResponse(content={"message": "Player added successfully"})
 
@@ -808,8 +852,9 @@ async def update_player(
 
 @app.delete("/api/admin/delete_player/{slug}/{student_id}")
 async def delete_player(slug: str, student_id: str, request: Request):
-    """Delete the player from the table using the provided slug and student_id."""
+    """Delete the player from the table using the provided table slug and student_id."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
+    table = tables_db.tables.find_one({"slug": slug})
 
     result = tables_db.tables.update_one(
         {"slug": slug},
@@ -818,6 +863,14 @@ async def delete_player(slug: str, student_id: str, request: Request):
             "$inc": {"total_joined_players": -1},
         },
     )
+    remaining_seats = int(table["player_quota"]) - (
+        int(table["total_joined_players"]) - 1
+    )
+    update_fields = {"available_seats": 1}
+    if remaining_seats == 1:  # Table becomes available
+        update_fields["available_tables"] = 1
+
+    events_db.events.update_one({"slug": table["event_slug"]}, {"$inc": update_fields})
 
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Player not found")
@@ -846,11 +899,26 @@ async def get_events(request: Request):
                 "end_date": 1,
                 "total_tables": 1,
                 "slug": 1,
+                "available_seats": 1,
+                "available_tables": 1,
             },
         )
     )
 
     return JSONResponse(content=events)
+
+
+@app.get("/api/events/{slug}/tables")
+async def get_event_tables(slug: str, request: Request):
+    """Get all tables for the event using the provided slug."""
+    await check_request(request, checkApiKey=False, checkOrigin=True)
+
+    event = events_db.events.find_one({"slug": slug})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    tables = list(tables_db.tables.find({"event_slug": slug}, {"_id": 0}))
+    return JSONResponse(content=tables)
 
 
 @app.get("/api/tables")
@@ -891,8 +959,9 @@ async def register_table(slug: str, player: Player, request: Request):
     """Register a player for the table using the provided slug."""
     await check_request(request, checkApiKey=False, checkOrigin=True)
     table = tables_db.tables.find_one({"slug": slug})
-    if not table:
-        raise HTTPException(status_code=404, detail="table not found")
+    event = events_db.events.find_one({"slug": table["event_slug"]})
+    if not table or not event:
+        raise HTTPException(status_code=404, detail="table or event not found")
 
     for existing_player in table.get("joined_players", []):
         if existing_player["student_id"] == player.student_id:
@@ -903,24 +972,136 @@ async def register_table(slug: str, player: Player, request: Request):
             status_code=400, detail="Invalid student ID. Must be 8 digits."
         )
 
-    if table["total_joined_players"] >= table["player_quota"]:
+    if table["total_joined_players"] >= int(table["player_quota"]):
         raise HTTPException(status_code=400, detail="table is full, no available seats")
 
     # Convert to dictionary and add registration timestamp
-    new_player = player.dict()
+    new_player = player.model_dump()
     new_player["registration_timestamp"] = (
         datetime.now().isoformat()
     )  # Store as ISO string
 
     tables_db.tables.update_one(
         {"slug": slug},
-        {
-            "$push": {"joined_players": new_player},
-            "$inc": {"total_joined_players": 1},
-        },
+        {"$push": {"joined_players": new_player}, "$inc": {"total_joined_players": 1}},
     )
+    remaining_seats = int(table["player_quota"]) - (
+        int(table["total_joined_players"]) + 1
+    )
+    update_fields = {"available_seats": -1}
+    if remaining_seats == 0:
+        update_fields["available_tables"] = -1
+
+    events_db.events.update_one({"slug": table["event_slug"]}, {"$inc": update_fields})
 
     return JSONResponse(content={"message": "Registration successful"})
+
+
+@app.put("/api/admin/events/{slug}")
+async def update_event(slug: str, request: Request):
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    event = events_db.events.find_one({"slug": slug})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    data = await request.json()
+    update_data = {
+        "name": data.get("name", event["name"]),
+        "description": data.get("description", event["description"]),
+        "start_date": data.get("start_date", event["start_date"]),
+        "end_date": data.get("end_date", event["end_date"]),
+    }
+
+    events_db.events.update_one({"slug": slug}, {"$set": update_data})
+    return JSONResponse(content={"message": "Event updated successfully"})
+
+
+@app.post("/api/admin/generate-report")
+async def generate_report(request: Request):
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    data = await request.json()
+    report_type = data.get("type")
+    language = data.get("language", "en")  # Default to English
+    print(f"Generating report in {language} for type: {report_type}")
+
+    # Language mappings
+    translations = {
+        "en": {
+            "headers": "Event Name,Event Status,Start Date,End Date,Total Tables,Total Players,Total Player Quota,Fill Rate",
+            "ongoing": "Ongoing",
+            "finished": "Finished",
+        },
+        "tr": {
+            "headers": "Etkinlik Adı,Etkinlik Durumu,Başlangıç Tarihi,Bitiş Tarihi,Toplam Masa,Toplam Oyuncu,Toplam Kontenjan,Doluluk Oranı",
+            "ongoing": "Devam Ediyor",
+            "finished": "Tamamlandı",
+        },
+    }
+
+    headers = translations[language]["headers"]
+
+    if report_type == "current":
+        events_list = list(events_db.events.find({}, {"_id": 0}))
+    elif report_type == "previous":
+        events_list = list(previous_events_db.events.find({}, {"_id": 0}))
+    elif report_type == "all":
+        current = list(events_db.events.find({}, {"_id": 0}))
+        previous = list(previous_events_db.events.find({}, {"_id": 0}))
+        events_list = current + previous
+    else:
+        raise HTTPException(status_code=400, detail="Invalid report type")
+
+    csv_rows = [headers]
+
+    for event in events_list:
+        total_players = 0
+        total_quota = 0
+
+        if isinstance(event["tables"], list) and all(
+            isinstance(x, str) for x in event["tables"]
+        ):
+            tables = list(tables_db.tables.find({"event_slug": event["slug"]}))
+        else:
+            tables = event["tables"]
+
+        for table in tables:
+            total_players += int(table["total_joined_players"])
+            total_quota += int(table["player_quota"])
+
+        fill_rate = (total_players / total_quota * 100) if total_quota > 0 else 0
+        status = (
+            translations[language]["ongoing"]
+            if event["is_ongoing"]
+            else translations[language]["finished"]
+        )
+
+        csv_rows.append(
+            f"{event['name']},"
+            f"{status},"
+            f"{event['start_date']},"
+            f"{event['end_date']},"
+            f"{event['total_tables']},"
+            f"{total_players},"
+            f"{total_quota},"
+            f"{fill_rate:.2f}%"
+        )
+
+    csv_content = "\n".join(csv_rows)
+    return JSONResponse(content={"csv": csv_content})
+
+
+@app.get("/api/admin/events/{slug}/announcement")
+async def generate_event_announcement(slug: str, request: Request):
+    """Generate an announcement image for an event."""
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    try:
+        img_buffer = create_event_announcement(slug)
+        return StreamingResponse(img_buffer, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # CHARROLLER (WIP - 11.12.24)#
@@ -1020,97 +1201,8 @@ async def process_character_sheet(
 
         print(f"Extracted text length: {len(text_content)}")
 
-        prompt = (
-            "SYSTEM: You are a D&D 5E character sheet analyzer that extracts rolls and abilities. Your task is to:"
-            "\n1. Extract character name"
-            "\n2. Preserve all basic ability checks and skills"
-            "\n3. Add character-specific rolls by analyzing:"
-            "   - Weapon proficiencies and attack bonuses"
-            "   - Spell attack bonus and save DCs"
-            "   - Class features and special abilities"
-            "   - Racial traits"
-            "\n\nINPUT: D&D 5E character sheet text"
-            "\nOUTPUT: JSON with character_name and comprehensive roll_list\n\n"
-            "RULES FOR ROLL EXTRACTION:"
-            "\n- Attack rolls: Add proficiency + ability modifier"
-            "\n- Damage rolls: Include ability modifier and any bonuses"
-            "\n- Spell attacks: Use spell attack bonus"
-            "\n- Save DCs: Format as 'DC X [Type] Save'"
-            "\n- Class abilities: Include action type and resource cost"
-            "\n\nEXAMPLE OUTPUT:"
-            """
-            {
-                "character_name": "Thorin Ironheart",
-                "roll_list": [
-                    {"roll_name": "Longsword Attack", "dice": "1d20+5"},
-                    {"roll_name": "Longsword Damage", "dice": "1d8+3"},
-                    {"roll_name": "Strength Check", "dice": "1d20+3"},
-                    {"roll_name": "Athletics", "dice": "1d20+5"},
-                    {"roll_name": "Fireball Damage", "dice": "8d6"},
-                    {"roll_name": "Spell Save DC", "dice": "DC 15"},
-                    {"roll_name": "Second Wind Healing", "dice": "1d10+3"},
-                    {"roll_name": "Initiative", "dice": "1d20+2"}
-                ]
-            }
-            """
-            "\n\nBASE TEMPLATE TO MODIFY (PRESERVE AND EXTEND):"
-            """{
-                "character_name": "(Extract from sheet)",
-                "roll_list": [
-                    {"roll_name": "Attack", "dice": "NdM+X"},
-                    {"roll_name": "Strength Check", "dice": "1d20+N"},
-                    {"roll_name": "Dexterity Check", "dice": "1d20+N"},
-                    {"roll_name": "Constitution Check", "dice": "1d20+N"},
-                    {"roll_name": "Intelligence Check", "dice": "1d20+N"},
-                    {"roll_name": "Wisdom Check", "dice": "1d20+N"},
-                    {"roll_name": "Charisma Check", "dice": "1d20+N"},
-                    {"roll_name": "Athletics", "dice": "1d20+N"},
-                    {"roll_name": "Acrobatics", "dice": "1d20+N"},
-                    {"roll_name": "Sleight of Hand", "dice": "1d20+N"},
-                    {"roll_name": "Stealth", "dice": "1d20+N"},
-                    {"roll_name": "Arcana", "dice": "1d20+N"},
-                    {"roll_name": "History", "dice": "1d20+N"},
-                    {"roll_name": "Investigation", "dice": "1d20+N"},
-                    {"roll_name": "Nature", "dice": "1d20+N"},
-                    {"roll_name": "Religion", "dice": "1d20+N"},
-                    {"roll_name": "Animal Handling", "dice": "1d20+N"},
-                    {"roll_name": "Insight", "dice": "1d20+N"},
-                    {"roll_name": "Medicine", "dice": "1d20+N"},
-                    {"roll_name": "Perception", "dice": "1d20+N"},
-                    {"roll_name": "Survival", "dice": "1d20+N"},
-                    {"roll_name": "Deception", "dice": "1d20+N"},
-                    {"roll_name": "Intimidation", "dice": "1d20+N"},
-                    {"roll_name": "Performance", "dice": "1d20+N"},
-                    {"roll_name": "Persuasion", "dice": "1d20+N"}
-                ]
-            }"""
-            "\n\nKEY EXTRACTION PRIORITIES:"
-            "\n1. Character Name (required)"
-            "\n2. Basic Ability Checks (preserve existing)"
-            "\n3. Skill Checks (preserve existing)"
-            "\n4. Weapon Attacks:"
-            "\n   - Format: '[Weapon] Attack' (1d20 + attack bonus)"
-            "\n   - Format: '[Weapon] Damage' (weapon die + modifiers)"
-            "\n5. Spellcasting:"
-            "\n   - Format: '[Spell] Attack' (1d20 + spell attack)"
-            "\n   - Format: '[Spell] Damage' (spell damage dice)"
-            "\n   - Include save DCs"
-            "\n6. Class Features:"
-            "\n   - Format: '[Feature] Check' or '[Feature] Roll'"
-            "\n   - Include healing, bonus actions, reactions"
-            "\n7. Special Abilities:"
-            "\n   - Racial traits"
-            "\n   - Background features"
-            "\n   - Magic item abilities"
-            "\n\nFORMATTING RULES:"
-            "\n- Use standard dice notation: 'NdM+X' or 'NdM-X'"
-            "\n- Keep roll names clear and concise (1-4 words)"
-            "\n- Include all modifiers and bonuses"
-            "\n- No explanatory text or formatting"
-            "\n- Raw JSON output only"
-            "\n\nPROCESS THIS CHARACTER SHEET:"
-            f"\n{text_content}"
-        )
+        # Get the prompt from environment variable
+        prompt = os.environ.get("CHARROLLER_PROMPT") + text_content
 
         # Process with LLM
         stream = client.chat.completions.create(
