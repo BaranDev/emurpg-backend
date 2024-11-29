@@ -1198,7 +1198,6 @@ async def process_character_sheet(
         text_content = " ".join(
             page.extract_text().replace("\n", " ") for page in pdf_reader.pages
         )
-
         print(f"Extracted text length: {len(text_content)}")
 
         # Get the prompt from environment variable
