@@ -504,7 +504,7 @@ def create_event_announcement(event_slug: str) -> BytesIO:
                     font=player_font,
                 )
                 player_y += 50
-
+               
         current_y += max_height_per_row[row] + table_margin
 
     # Footer with dice
@@ -513,7 +513,6 @@ def create_event_announcement(event_slug: str) -> BytesIO:
     footer_width = footer_bbox[2] - footer_bbox[0]
     footer_x = (WIDTH - footer_width) // 2
     footer_y = HEIGHT - 80
-
     # Draw footer text
     draw.text((footer_x, footer_y), footer_text, TEXT_COLOR, font=footer_font)
 
@@ -1187,7 +1186,6 @@ async def process_character_sheet(
             raise HTTPException(status_code=400, detail="No file provided")
 
         print(f"Processing file: {file.filename}")
-
         try:
             contents = await file.read()
             pdf_file = BytesIO(contents)
