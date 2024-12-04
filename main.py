@@ -1181,60 +1181,64 @@ def validate_roll_format(roll_list: list) -> list:
 async def process_character_sheet(
     file: UploadFile = File(...), request: Request = None
 ):
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided")
+    if DEV:
+        if not file:
+            raise HTTPException(status_code=400, detail="No file provided")
 
-    print(f"Processing file: {file.filename}")
+        print(f"Processing file: {file.filename}")
 
-    try:
-        contents = await file.read()
-        pdf_file = BytesIO(contents)
+        try:
+            contents = await file.read()
+            pdf_file = BytesIO(contents)
 
-        if not file.filename.endswith(".pdf"):
-            raise HTTPException(
-                status_code=400, detail="Invalid file type. Please upload a PDF file."
+            if not file.filename.endswith(".pdf"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid file type. Please upload a PDF file.",
+                )
+
+            pdf_reader = PdfReader(pdf_file)
+            text_content = " ".join(
+                page.extract_text().replace("\n", " ") for page in pdf_reader.pages
+            )
+            print(f"Extracted text length: {len(text_content)}")
+
+            # Get the prompt from environment variable
+            prompt = os.environ.get("CHARROLLER_PROMPT") + text_content
+
+            # Process with LLM
+            stream = client.chat.completions.create(
+                model="meta-llama/Meta-Llama-3-8B-Instruct",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000,
+                stream=True,
+                temperature=0.2,
             )
 
-        pdf_reader = PdfReader(pdf_file)
-        text_content = " ".join(
-            page.extract_text().replace("\n", " ") for page in pdf_reader.pages
-        )
-        print(f"Extracted text length: {len(text_content)}")
+            response_text = "".join(
+                chunk.choices[0].delta.content
+                for chunk in stream
+                if hasattr(chunk.choices[0].delta, "content")
+            )
 
-        # Get the prompt from environment variable
-        prompt = os.environ.get("CHARROLLER_PROMPT") + text_content
+            # Parse and validate response
+            response_json = parse_llm_response(response_text)
+            validated_rolls = validate_roll_format(response_json.get("roll_list", []))
 
-        # Process with LLM
-        stream = client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3-8B-Instruct",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
-            stream=True,
-            temperature=0.2,
-        )
+            response_data = {
+                "character_name": response_json.get("character_name", "Unknown"),
+                "roll_list": validated_rolls,
+            }
 
-        response_text = "".join(
-            chunk.choices[0].delta.content
-            for chunk in stream
-            if hasattr(chunk.choices[0].delta, "content")
-        )
+            return JSONResponse(content=response_data)
 
-        # Parse and validate response
-        response_json = parse_llm_response(response_text)
-        validated_rolls = validate_roll_format(response_json.get("roll_list", []))
-
-        response_data = {
-            "character_name": response_json.get("character_name", "Unknown"),
-            "roll_list": validated_rolls,
-        }
-
-        return JSONResponse(content=response_data)
-
-    except Exception as e:
-        print(f"Error handling file: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error handling file: {str(e)}")
-    finally:
-        await file.close()
+        except Exception as e:
+            print(f"Error handling file: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail=f"Error handling file: {str(e)}"
+            )
+        finally:
+            await file.close()
 
 
 if __name__ == "__main__":
