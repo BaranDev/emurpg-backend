@@ -1129,20 +1129,21 @@ client = OpenAI(
 
 def parse_llm_response(response_text: str) -> dict:
     """Parses and cleans LLM response into valid JSON format"""
-    # Remove any markdown formatting or extra text
-    clean_text = (
-        re.sub(r"```json\s*|\s*```", "", response_text).replace("\\", "").strip()
-    )
+    if DEV:
+        # Remove any markdown formatting or extra text
+        clean_text = (
+            re.sub(r"```json\s*|\s*```", "", response_text).replace("\\", "").strip()
+        )
 
-    try:
-        # Try to parse the JSON directly
-        return json.loads(clean_text)
-    except json.JSONDecodeError:
-        # If that fails, try to find JSON object in the text
-        json_match = re.search(r"\{.*\}", clean_text, re.DOTALL)
-        if not json_match:
-            raise ValueError("Invalid JSON response")
-        return json.loads(json_match.group())
+        try:
+            # Try to parse the JSON directly
+            return json.loads(clean_text)
+        except json.JSONDecodeError:
+            # If that fails, try to find JSON object in the text
+            json_match = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            if not json_match:
+                raise ValueError("Invalid JSON response")
+            return json.loads(json_match.group())
 
 
 def validate_roll_format(roll_list: list) -> list:
@@ -1150,90 +1151,95 @@ def validate_roll_format(roll_list: list) -> list:
     Validates roll format while preserving original values.
     Only fixes obviously incorrect formats.
     """
-    validated_rolls = []
-    dice_pattern = re.compile(r"^(\d+d\d+([+-]\d+)?|DC \d+)$")
+    if DEV:
+        validated_rolls = []
+        dice_pattern = re.compile(r"^(\d+d\d+([+-]\d+)?|DC \d+)$")
 
-    for roll in roll_list:
-        roll_name = roll.get("roll_name", "").strip()
-        dice = roll.get("dice", "").strip()
+        for roll in roll_list:
+            roll_name = roll.get("roll_name", "").strip()
+            dice = roll.get("dice", "").strip()
 
-        # Skip empty or invalid rolls
-        if not roll_name or not dice:
-            continue
+            # Skip empty or invalid rolls
+            if not roll_name or not dice:
+                continue
 
-        # Only fix dice notation if it's clearly wrong
-        if not dice_pattern.match(dice) and not dice.startswith("DC "):
-            # Check if it's just missing the 'd'
-            if re.match(r"^\d+\d+([+-]\d+)?$", dice):
-                # Fix common format error (e.g., "120" -> "1d20")
-                dice = f"{dice[0]}d{dice[1:]}"
-            # If it has a bonus but no dice, assume 1d20
-            elif re.match(r"^[+-]\d+$", dice):
-                dice = f"1d20{dice}"
+            # Only fix dice notation if it's clearly wrong
+            if not dice_pattern.match(dice) and not dice.startswith("DC "):
+                # Check if it's just missing the 'd'
+                if re.match(r"^\d+\d+([+-]\d+)?$", dice):
+                    # Fix common format error (e.g., "120" -> "1d20")
+                    dice = f"{dice[0]}d{dice[1:]}"
+                # If it has a bonus but no dice, assume 1d20
+                elif re.match(r"^[+-]\d+$", dice):
+                    dice = f"1d20{dice}"
 
-        validated_rolls.append({"roll_name": roll_name, "dice": dice})
+            validated_rolls.append({"roll_name": roll_name, "dice": dice})
 
-    return validated_rolls
+        return validated_rolls
 
 
 @app.post("/api/charroller/process")
 async def process_character_sheet(
     file: UploadFile = File(...), request: Request = None
 ):
-    if not file:
-        raise HTTPException(status_code=400, detail="No file provided")
+    if DEV:
+        if not file:
+            raise HTTPException(status_code=400, detail="No file provided")
 
-    print(f"Processing file: {file.filename}")
+        print(f"Processing file: {file.filename}")
 
-    try:
-        contents = await file.read()
-        pdf_file = BytesIO(contents)
+        try:
+            contents = await file.read()
+            pdf_file = BytesIO(contents)
 
-        if not file.filename.endswith(".pdf"):
-            raise HTTPException(
-                status_code=400, detail="Invalid file type. Please upload a PDF file."
+            if not file.filename.endswith(".pdf"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid file type. Please upload a PDF file.",
+                )
+
+            pdf_reader = PdfReader(pdf_file)
+            text_content = " ".join(
+                page.extract_text().replace("\n", " ") for page in pdf_reader.pages
+            )
+            print(f"Extracted text length: {len(text_content)}")
+
+            # Get the prompt from environment variable
+            prompt = os.environ.get("CHARROLLER_PROMPT") + text_content
+
+            # Process with LLM
+            stream = client.chat.completions.create(
+                model="meta-llama/Meta-Llama-3-8B-Instruct",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000,
+                stream=True,
+                temperature=0.2,
             )
 
-        pdf_reader = PdfReader(pdf_file)
-        text_content = " ".join(
-            page.extract_text().replace("\n", " ") for page in pdf_reader.pages
-        )
-        print(f"Extracted text length: {len(text_content)}")
+            response_text = "".join(
+                chunk.choices[0].delta.content
+                for chunk in stream
+                if hasattr(chunk.choices[0].delta, "content")
+            )
 
-        # Get the prompt from environment variable
-        prompt = os.environ.get("CHARROLLER_PROMPT") + text_content
+            # Parse and validate response
+            response_json = parse_llm_response(response_text)
+            validated_rolls = validate_roll_format(response_json.get("roll_list", []))
 
-        # Process with LLM
-        stream = client.chat.completions.create(
-            model="meta-llama/Meta-Llama-3-8B-Instruct",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
-            stream=True,
-            temperature=0.2,
-        )
+            response_data = {
+                "character_name": response_json.get("character_name", "Unknown"),
+                "roll_list": validated_rolls,
+            }
 
-        response_text = "".join(
-            chunk.choices[0].delta.content
-            for chunk in stream
-            if hasattr(chunk.choices[0].delta, "content")
-        )
+            return JSONResponse(content=response_data)
 
-        # Parse and validate response
-        response_json = parse_llm_response(response_text)
-        validated_rolls = validate_roll_format(response_json.get("roll_list", []))
-
-        response_data = {
-            "character_name": response_json.get("character_name", "Unknown"),
-            "roll_list": validated_rolls,
-        }
-
-        return JSONResponse(content=response_data)
-
-    except Exception as e:
-        print(f"Error handling file: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error handling file: {str(e)}")
-    finally:
-        await file.close()
+        except Exception as e:
+            print(f"Error handling file: {str(e)}")
+            raise HTTPException(
+                status_code=500, detail=f"Error handling file: {str(e)}"
+            )
+        finally:
+            await file.close()
 
 
 if __name__ == "__main__":
