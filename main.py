@@ -24,7 +24,8 @@ from io import BytesIO
 import requests
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
-from moesifasgi import MoesifMiddleware
+
+# from moesifasgi import MoesifMiddleware # DISABLED FOR NOW
 import asyncio
 from contextlib import asynccontextmanager
 from bson.json_util import default
@@ -195,7 +196,7 @@ moesif_settings = {
 }
 
 ## Add Moesif middleware to the app
-app.add_middleware(MoesifMiddleware, settings=moesif_settings)
+# app.add_middleware(MoesifMiddleware, settings=moesif_settings) # DISABLED FOR NOW
 
 # Add fonts
 font_dir = "resources/fonts"
