@@ -505,7 +505,7 @@ def create_event_announcement(event_slug: str) -> BytesIO:
                     font=player_font,
                 )
                 player_y += 50
-
+               
         current_y += max_height_per_row[row] + table_margin
 
     # Footer with dice
@@ -514,7 +514,6 @@ def create_event_announcement(event_slug: str) -> BytesIO:
     footer_width = footer_bbox[2] - footer_bbox[0]
     footer_x = (WIDTH - footer_width) // 2
     footer_y = HEIGHT - 80
-
     # Draw footer text
     draw.text((footer_x, footer_y), footer_text, TEXT_COLOR, font=footer_font)
 
@@ -1130,20 +1129,21 @@ client = OpenAI(
 
 def parse_llm_response(response_text: str) -> dict:
     """Parses and cleans LLM response into valid JSON format"""
-    # Remove any markdown formatting or extra text
-    clean_text = (
-        re.sub(r"```json\s*|\s*```", "", response_text).replace("\\", "").strip()
-    )
+    if DEV:
+        # Remove any markdown formatting or extra text
+        clean_text = (
+            re.sub(r"```json\s*|\s*```", "", response_text).replace("\\", "").strip()
+        )
 
-    try:
-        # Try to parse the JSON directly
-        return json.loads(clean_text)
-    except json.JSONDecodeError:
-        # If that fails, try to find JSON object in the text
-        json_match = re.search(r"\{.*\}", clean_text, re.DOTALL)
-        if not json_match:
-            raise ValueError("Invalid JSON response")
-        return json.loads(json_match.group())
+        try:
+            # Try to parse the JSON directly
+            return json.loads(clean_text)
+        except json.JSONDecodeError:
+            # If that fails, try to find JSON object in the text
+            json_match = re.search(r"\{.*\}", clean_text, re.DOTALL)
+            if not json_match:
+                raise ValueError("Invalid JSON response")
+            return json.loads(json_match.group())
 
 
 def validate_roll_format(roll_list: list) -> list:
@@ -1151,30 +1151,31 @@ def validate_roll_format(roll_list: list) -> list:
     Validates roll format while preserving original values.
     Only fixes obviously incorrect formats.
     """
-    validated_rolls = []
-    dice_pattern = re.compile(r"^(\d+d\d+([+-]\d+)?|DC \d+)$")
+    if DEV:
+        validated_rolls = []
+        dice_pattern = re.compile(r"^(\d+d\d+([+-]\d+)?|DC \d+)$")
 
-    for roll in roll_list:
-        roll_name = roll.get("roll_name", "").strip()
-        dice = roll.get("dice", "").strip()
+        for roll in roll_list:
+            roll_name = roll.get("roll_name", "").strip()
+            dice = roll.get("dice", "").strip()
 
-        # Skip empty or invalid rolls
-        if not roll_name or not dice:
-            continue
+            # Skip empty or invalid rolls
+            if not roll_name or not dice:
+                continue
 
-        # Only fix dice notation if it's clearly wrong
-        if not dice_pattern.match(dice) and not dice.startswith("DC "):
-            # Check if it's just missing the 'd'
-            if re.match(r"^\d+\d+([+-]\d+)?$", dice):
-                # Fix common format error (e.g., "120" -> "1d20")
-                dice = f"{dice[0]}d{dice[1:]}"
-            # If it has a bonus but no dice, assume 1d20
-            elif re.match(r"^[+-]\d+$", dice):
-                dice = f"1d20{dice}"
+            # Only fix dice notation if it's clearly wrong
+            if not dice_pattern.match(dice) and not dice.startswith("DC "):
+                # Check if it's just missing the 'd'
+                if re.match(r"^\d+\d+([+-]\d+)?$", dice):
+                    # Fix common format error (e.g., "120" -> "1d20")
+                    dice = f"{dice[0]}d{dice[1:]}"
+                # If it has a bonus but no dice, assume 1d20
+                elif re.match(r"^[+-]\d+$", dice):
+                    dice = f"1d20{dice}"
 
-        validated_rolls.append({"roll_name": roll_name, "dice": dice})
+            validated_rolls.append({"roll_name": roll_name, "dice": dice})
 
-    return validated_rolls
+        return validated_rolls
 
 
 @app.post("/api/charroller/process")
@@ -1186,7 +1187,6 @@ async def process_character_sheet(
             raise HTTPException(status_code=400, detail="No file provided")
 
         print(f"Processing file: {file.filename}")
-
         try:
             contents = await file.read()
             pdf_file = BytesIO(contents)
@@ -1214,7 +1214,6 @@ async def process_character_sheet(
                 stream=True,
                 temperature=0.2,
             )
-
             response_text = "".join(
                 chunk.choices[0].delta.content
                 for chunk in stream
