@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 from bson.json_util import default
 
 # Development mode flag to disable api key and origin checks
-DEV = True
+DEV = False
 
 load_dotenv()
 
