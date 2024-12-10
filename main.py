@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 from bson.json_util import default
 
 # Development mode flag to disable api key and origin checks
-DEV = False
+DEV = True
 
 load_dotenv()
 
@@ -140,7 +140,7 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-origins = ["*"] if DEV else ["https://events.emurpg.com"]
+origins = ["*"] if DEV else ["https://www.emurpg.com"]
 
 # CORS middleware
 app.add_middleware(
@@ -327,14 +327,14 @@ async def check_api_key(request: Request):
 
 
 async def check_origin(request: Request):
-    """Check if the request origin is allowed (https://events.emurpg.com)."""
+    """Check if the request origin is allowed (https://www.emurpg.com)."""
     if DEV:
         return True
     # Get the "Origin" header from the request
     origin_header = request.headers.get("origin")
     print(f"Got a {request.method} request from origin: {origin_header}")
 
-    allowed_origin = "https://events.emurpg.com"
+    allowed_origin = "https://www.emurpg.com"
 
     # Check if the origin is missing or does not match the allowed origin
     if origin_header != allowed_origin:
@@ -505,7 +505,7 @@ def create_event_announcement(event_slug: str) -> BytesIO:
                     font=player_font,
                 )
                 player_y += 50
-               
+
         current_y += max_height_per_row[row] + table_margin
 
     # Footer with dice
