@@ -21,7 +21,7 @@ from hashlib import sha256
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from io import BytesIO
-import requests
+import httpx
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
 
@@ -32,7 +32,7 @@ from bson.json_util import default
 
 # Development mode flag to disable api key and origin checks
 DEV = False
-
+WS_MESSAGE = "Records updated"
 load_dotenv()
 
 
@@ -63,10 +63,15 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
         for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                print(f"Failed to send message to a connection: {e}")
             await connection.send_json(message)
 
 
@@ -75,7 +80,6 @@ manager = ConnectionManager()  # Connection manager instance
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown tasks for the FastAPI application."""
     try:
         await startup_tasks()
         yield
@@ -84,17 +88,23 @@ async def lifespan(app: FastAPI):
 
 
 async def startup_tasks():
-    """Start the change monitoring tasks on startup."""
-    asyncio.create_task(monitor_table_changes())
-    asyncio.create_task(monitor_event_changes())
+    try:
+        asyncio.create_task(monitor_table_changes())
+        asyncio.create_task(monitor_event_changes())
+    except Exception as e:
+        print(f"Error during startup tasks: {e}")
 
 
 async def shutdown_tasks():
-    """Close all active connections and the WebSocket client on shutdown."""
     for connection in manager.active_connections:
-        await connection.disconnect()
-    await ws_client.close()
-    await client.close()
+        try:
+            await connection.disconnect()
+        except Exception as e:
+            print(f"Error disconnecting websocket: {e}")
+    if ws_client:
+        await ws_client.close()
+    if client:
+        client.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -109,12 +119,13 @@ async def monitor_table_changes():
         async for change in change_stream:
             # Clean the change document before broadcasting
             cleaned_change = json.loads(json.dumps(change, default=default))
-            await manager.broadcast({"message": "Records updated"})
+            await manager.broadcast({"message": WS_MESSAGE})
             print(f"Change broadcasted: {cleaned_change}")
     except PyMongoError as e:
         print(f"MongoDB change stream error: {e}")
     finally:
-        await change_stream.close()
+        if change_stream is not None:
+            await change_stream.close()
 
 
 async def monitor_event_changes():
@@ -146,7 +157,7 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-origins = ["*"] if DEV else ["https://events.emurpg.com"]
+origins = ["*"] if DEV else ["https://www.emurpg.com", "https://emurpg.com"]
 
 # CORS middleware
 app.add_middleware(
@@ -169,7 +180,7 @@ async def custom_should_skip(request):
     if hasattr(request, "scope") and request.scope.get("_is_file_upload"):
         return True
 
-    content_type = request.headers.get("content-type", "")
+    content_type = request.headers.get("content-type", "") if request.headers else ""
     path = request.url.path
     will_skip = any(ep in path for ep in Moesif_enpoints_to_skip) or any(
         ct in content_type for ct in Moesif_content_types_to_skip
@@ -319,7 +330,11 @@ async def check_api_key(request: Request):
 
     try:
         # Attempt to parse the API key as JSON if it has { } format
-        if api_key_header.startswith("{") and api_key_header.endswith("}"):
+        if (
+            api_key_header
+            and api_key_header.startswith("{")
+            and api_key_header.endswith("}")
+        ):
             api_key_data = json.loads(api_key_header)
             api_key = api_key_data.get("apiKey")
         else:
@@ -366,9 +381,12 @@ async def check_origin(request: Request):
 
 async def fetch_current_datetime():
     """Fetch the current datetime from Time API in Cyprus timezone."""
-    return requests.get(
-        "https://timeapi.io/api/time/current/zone?timeZone=Europe%2FAthens"
-    ).json()["dateTime"]
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://timeapi.io/api/time/current/zone?timeZone=Europe%2FAthens"
+        )
+        response.raise_for_status()
+        return response.json()["dateTime"]
 
 
 async def check_request(
@@ -381,8 +399,6 @@ async def check_request(
 
 
 from PIL import Image, ImageDraw, ImageFont
-import textwrap
-from pathlib import Path
 
 
 def create_event_announcement(event_slug: str) -> BytesIO:
@@ -1178,8 +1194,7 @@ def parse_llm_response(response_text: str) -> dict:
 
 
 def validate_roll_format(roll_list: list) -> list:
-    """
-    Validates roll format while preserving original values.
+    """Validates roll format while preserving original values.
     Only fixes obviously incorrect formats.
     """
     if DEV:
@@ -1188,7 +1203,9 @@ def validate_roll_format(roll_list: list) -> list:
 
         for roll in roll_list:
             roll_name = roll.get("roll_name", "").strip()
-            dice = roll.get("dice", "").strip()
+            dice = roll.get("dice", "")
+            if dice is not None:
+                dice = dice.strip()
 
             # Skip empty or invalid rolls
             if not roll_name or not dice:
