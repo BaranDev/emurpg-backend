@@ -24,6 +24,7 @@ from io import BytesIO
 import httpx
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # from moesifasgi import MoesifMiddleware # DISABLED FOR NOW
 import asyncio
@@ -35,8 +36,6 @@ DEV = False
 WS_MESSAGE = "Records updated"
 load_dotenv()
 
-
-from motor.motor_asyncio import AsyncIOMotorClient
 
 # MongoDB connection
 ws_client = AsyncIOMotorClient(os.environ.get("MONGO_URI"))
@@ -352,7 +351,6 @@ async def check_api_key(request: Request):
         api_db.api_keys.update_one(
             {"api_key": api_key}, {"$push": {"used_times": current_time}}
         )
-        print(f"API key of {api_key.owner} is used at {current_time}.")
         return True
 
     # Raise error if the API key is invalid
