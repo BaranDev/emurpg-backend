@@ -53,6 +53,8 @@ admin_db = client["admin_accounts"]
 
 
 class ConnectionManager:
+    """Manage WebSocket connections and broadcast messages to all clients."""
+
     def __init__(self):
         self.active_connections: List[WebSocket] = []
 
@@ -73,6 +75,7 @@ manager = ConnectionManager()  # Connection manager instance
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Startup and shutdown tasks for the FastAPI application."""
     try:
         await startup_tasks()
         yield
@@ -81,11 +84,13 @@ async def lifespan(app: FastAPI):
 
 
 async def startup_tasks():
+    """Start the change monitoring tasks on startup."""
     asyncio.create_task(monitor_table_changes())
     asyncio.create_task(monitor_event_changes())
 
 
 async def shutdown_tasks():
+    """Close all active connections and the WebSocket client on shutdown."""
     for connection in manager.active_connections:
         await connection.disconnect()
     await ws_client.close()
@@ -132,6 +137,7 @@ async def monitor_event_changes():
 
 @app.websocket("/ws/updates")
 async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates."""
     await manager.connect(websocket)
     try:
         while True:
@@ -209,6 +215,8 @@ for font_file in font_files:
 
 
 class Player(BaseModel):
+    """Class that holds: name, student_id, table_id, seat_id, contact(optional) for a player."""
+
     name: str
     student_id: str
     table_id: str
@@ -217,6 +225,8 @@ class Player(BaseModel):
 
 
 class PlayerUpdate(BaseModel):
+    """Class that holds: name, student_id, table_id, seat_id, contact(optional) for a player."""
+
     name: str
     student_id: str
     table_id: str
@@ -225,6 +235,8 @@ class PlayerUpdate(BaseModel):
 
 
 class Table(BaseModel):
+    """Class that holds: game_name, game_master, player_quota, total_joined_players, joined_players, slug, created_at for a table."""
+
     game_name: str
     game_master: str
     player_quota: int
@@ -235,34 +247,39 @@ class Table(BaseModel):
 
 
 class AdminCredentials(BaseModel):
+    """Class that holds: username, hashedPassword for an admin."""
+
     username: str
     hashedPassword: str
 
 
 class Member(BaseModel):
+    """Class that holds: name, is_manager, manager_name(optional), game_played(optional), player_quota(optional) for a member."""
+
     name: str
     is_manager: bool
     manager_name: Optional[str] = Field(default=None)
     game_played: Optional[str] = Field(default=None)
-    player_quota: Optional[int] = Field(
-        default=0
-    )  # Added player_quota for compatibility
+    player_quota: Optional[int] = Field(default=0)
 
 
-# Add new Pydantic models
 class Event(BaseModel):
+    """Class that holds: name, description, start_date, end_date, is_ongoing, total_tables, tables, slug, created_at for an event."""
+
     name: str
     description: Optional[str]
     start_date: str
     end_date: str
     is_ongoing: bool = True
     total_tables: int = 0
-    tables: List[str] = []  # List of table slugs
+    tables: List[str] = []
     slug: str
     created_at: str
 
 
 class EventCreate(BaseModel):
+    """Class that holds: name, description, start_date, end_date for creating an event."""
+
     name: str
     description: Optional[str]
     start_date: str
@@ -320,6 +337,7 @@ async def check_api_key(request: Request):
         api_db.api_keys.update_one(
             {"api_key": api_key}, {"$push": {"used_times": current_time}}
         )
+        print(f"API key of {api_key.owner} is used at {current_time}.")
         return True
 
     # Raise error if the API key is invalid
@@ -327,17 +345,20 @@ async def check_api_key(request: Request):
 
 
 async def check_origin(request: Request):
-    """Check if the request origin is allowed (https://events.emurpg.com)."""
+    """Check if the request origin is allowed (https://www.emurpg.com or https://emurpg.com)."""
     if DEV:
         return True
     # Get the "Origin" header from the request
     origin_header = request.headers.get("origin")
     print(f"Got a {request.method} request from origin: {origin_header}")
 
-    allowed_origin = "https://events.emurpg.com"
+    allowed_origins = [
+        "https://www.emurpg.com",
+        "https://emurpg.com",
+    ]
 
-    # Check if the origin is missing or does not match the allowed origin
-    if origin_header != allowed_origin:
+    # Check if the origin is allowed origins list
+    if origin_header not in allowed_origins:
         raise HTTPException(status_code=403, detail="Forbidden: Invalid origin.")
 
     return True  # Origin is valid, proceed with the request
@@ -505,7 +526,7 @@ def create_event_announcement(event_slug: str) -> BytesIO:
                     font=player_font,
                 )
                 player_y += 50
-               
+
         current_y += max_height_per_row[row] + table_margin
 
     # Footer with dice
@@ -533,6 +554,7 @@ def create_event_announcement(event_slug: str) -> BytesIO:
 # New Admin Endpoints for Events
 @app.post("/api/admin/events")
 async def create_event(event: EventCreate, request: Request):
+    """Create a new event with the provided details."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     new_event = {
@@ -558,6 +580,7 @@ async def create_event(event: EventCreate, request: Request):
 
 @app.get("/api/admin/events")
 async def get_admin_events(request: Request):
+    """Get all events from the database with all the sensitive"""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     events = list(events_db.events.find({}, {"_id": 0}))
@@ -566,6 +589,7 @@ async def get_admin_events(request: Request):
 
 @app.put("/api/admin/events/{slug}/finish")
 async def finish_event(slug: str, request: Request):
+    """Finish the event using the provided slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     event = events_db.events.find_one({"slug": slug})
@@ -592,6 +616,7 @@ async def finish_event(slug: str, request: Request):
 
 @app.delete("/api/admin/events/{slug}")
 async def delete_event(slug: str, request: Request):
+    """Delete the event using the provided slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     event = events_db.events.find_one({"slug": slug})
@@ -670,6 +695,7 @@ async def get_table(slug: str, request: Request):
 
 @app.post("/api/admin/table/{slug}")
 async def update_table(slug: str, request: Request):
+    """Update the table details using the provided slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
@@ -695,7 +721,7 @@ async def update_table(slug: str, request: Request):
     # Calculate seat changes
     old_available = old_quota - old_joined
     new_available = new_quota - new_joined
-    seat_difference = new_quota - old_quota
+    # seat_difference = new_quota - old_quota # Might be useful later
 
     # Update tables collection
     tables_db.tables.update_one({"slug": slug}, {"$set": update_data})
@@ -713,6 +739,7 @@ async def update_table(slug: str, request: Request):
 
 @app.delete("/api/admin/table/{slug}")
 async def delete_table(slug: str, request: Request):
+    """Delete the table using the provided slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
@@ -739,6 +766,7 @@ async def delete_table(slug: str, request: Request):
 
 @app.post("/api/admin/create_table/{event_slug}")
 async def create_table(event_slug: str, request: Request):
+    """Create a new table for the event using the provided event slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     event = events_db.events.find_one({"slug": event_slug})
@@ -885,6 +913,7 @@ async def delete_player(slug: str, student_id: str, request: Request):
 
 @app.get("/api/events")
 async def get_events(request: Request):
+    """Get all ongoing events from the database without sensitive data."""
     await check_request(request, checkApiKey=False, checkOrigin=True)
 
     # Only return ongoing events with non-sensitive data
@@ -999,6 +1028,7 @@ async def register_table(slug: str, player: Player, request: Request):
 
 @app.put("/api/admin/events/{slug}")
 async def update_event(slug: str, request: Request):
+    """Update the event details using the provided slug."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     event = events_db.events.find_one({"slug": slug})
@@ -1019,6 +1049,7 @@ async def update_event(slug: str, request: Request):
 
 @app.post("/api/admin/generate-report")
 async def generate_report(request: Request):
+    """Generate a CSV report for all events."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     data = await request.json()
