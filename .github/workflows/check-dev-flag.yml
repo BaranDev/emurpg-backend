@@ -1,0 +1,23 @@
+name: Check Dev Flags
+
+on: 
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  check-dev-flags:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Check Dev Flags in Backend (Python)
+        run: |
+          if grep -q 'DEV = True' main.py; then
+            echo "❌ DEV flag must be False in main.py before merging!"
+            exit 1
+          else
+            echo "✅ DEV flag is correctly set in main.py."
+          fi
