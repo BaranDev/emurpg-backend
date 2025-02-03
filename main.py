@@ -660,7 +660,7 @@ async def get_tables(request: Request):
 
 @app.post("/api/admin/create_admin")
 async def create_admin(credentials: AdminCredentials, request: Request):
-    """Create a new admin account with the provided credentials."""
+    """Create a new admin account with the provided credentials. Send"""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     new_admin = {
@@ -1147,6 +1147,15 @@ async def generate_event_announcement(slug: str, request: Request):
         return StreamingResponse(img_buffer, media_type="image/png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/generateapikey")
+async def generate_api_key_endpoint(request: Request):
+    """Generate a new API key for the user."""
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+    owner = request.headers.get("owner")
+    new_api_key = generate_api_key(owner=owner)
+    return JSONResponse(content={"api_key": new_api_key}, status_code=201)
 
 
 # CHARROLLER (WIP - 11.12.24)#
