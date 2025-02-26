@@ -722,7 +722,6 @@ async def add_player(slug: str, player: Player, request: Request):
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
-    # event = events_db.events.find_one({"slug": table["event_slug"]}) # For future use
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
 
@@ -730,9 +729,6 @@ async def add_player(slug: str, player: Player, request: Request):
     new_player["registration_timestamp"] = await fetch_current_datetime()
     print(new_player)
 
-    remaining_seats = int(table["player_quota"]) - (
-        int(table["total_joined_players"]) + 1
-    )
     tables_db.tables.update_one(
         {"slug": slug},
         {
@@ -740,11 +736,6 @@ async def add_player(slug: str, player: Player, request: Request):
             "$inc": {"total_joined_players": 1},
         },
     )
-    update_fields = {"available_seats": -1}
-    if remaining_seats == 0:
-        update_fields["available_tables"] = -1
-
-    events_db.events.update_one({"slug": table["event_slug"]}, {"$inc": update_fields})
 
     return JSONResponse(content={"message": "Player added successfully"})
 
@@ -771,7 +762,6 @@ async def update_player(
 async def delete_player(slug: str, student_id: str, request: Request):
     """Delete the player from the table using the provided table slug and student_id."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
-    table = tables_db.tables.find_one({"slug": slug})
 
     result = tables_db.tables.update_one(
         {"slug": slug},
@@ -780,14 +770,6 @@ async def delete_player(slug: str, student_id: str, request: Request):
             "$inc": {"total_joined_players": -1},
         },
     )
-    remaining_seats = int(table["player_quota"]) - (
-        int(table["total_joined_players"]) - 1
-    )
-    update_fields = {"available_seats": 1}
-    if remaining_seats == 1:  # Table becomes available
-        update_fields["available_tables"] = 1
-
-    events_db.events.update_one({"slug": table["event_slug"]}, {"$inc": update_fields})
 
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Player not found")
