@@ -30,9 +30,11 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
 from contextlib import asynccontextmanager
 from bson.json_util import default
+from announcement_generator import create_event_announcement
 
 # Development mode flag to disable api key and origin checks
 DEV = False
+# Websocket message for updates
 WS_MESSAGE = "Records updated"
 load_dotenv()
 
@@ -43,6 +45,7 @@ client = MongoClient(os.environ.get("MONGO_URI"))
 events_db = client["events"]
 previous_events_db = client["previous_events"]
 tables_db = client["tables"]
+games_db = client["games"]
 ws_tables_db = ws_client["tables"]
 ws_events_db = ws_client["events"]
 api_db = client["api_keys"]
@@ -225,35 +228,42 @@ for font_file in font_files:
 
 
 class Player(BaseModel):
-    """Class that holds: name, student_id, table_id, seat_id, contact(optional) for a player."""
+    """Class that holds: name, student_id, table_id, contact(optional) for a player."""
 
     name: str
     student_id: str
     table_id: str
-    seat_id: int
     contact: Optional[str] = None
 
 
 class PlayerUpdate(BaseModel):
-    """Class that holds: name, student_id, table_id, seat_id, contact(optional) for a player."""
+    """Class that holds: name, student_id, table_id, contact(optional) for a player."""
 
     name: str
     student_id: str
     table_id: str
-    seat_id: int
     contact: Optional[str] = None
 
 
 class Table(BaseModel):
-    """Class that holds: game_name, game_master, player_quota, total_joined_players, joined_players, slug, created_at for a table."""
+    """Class that holds: game_name, game_master, player_quota, total_joined_players, joined_players,
+    approved_players, rejected_players, backup_players, slug, created_at for a table."""
 
     game_name: str
     game_master: str
+    language: str
     player_quota: int
     total_joined_players: int = 0
     joined_players: List[Player] = []
+    approved_players: List[Player] = []
+    rejected_players: List[Player] = []
+    backup_players: List[Player] = []
     slug: str
     created_at: str
+    # New fields
+    game_id: Optional[str] = None
+    game_image: Optional[str] = None
+    game_play_time: Optional[int] = None
 
 
 class AdminCredentials(BaseModel):
@@ -294,6 +304,19 @@ class EventCreate(BaseModel):
     description: Optional[str]
     start_date: str
     end_date: str
+
+
+class Game(BaseModel):
+    """Class that holds: id, name, avg_play_time, min_players, max_players, image_url, guide_text, guide_video_url for a game."""
+
+    id: str
+    name: str
+    avg_play_time: int
+    min_players: int
+    max_players: int
+    image_url: Optional[str] = None
+    guide_text: Optional[str] = None
+    guide_video_url: Optional[str] = None
 
 
 # Helper functions #
@@ -396,176 +419,20 @@ async def check_request(
         await check_origin(request)
 
 
-from PIL import Image, ImageDraw, ImageFont
-
-
-def create_event_announcement(event_slug: str) -> BytesIO:
-    """Create a medieval-themed announcement image with enhanced graphics."""
-    event = events_db.events.find_one({"slug": event_slug})
-    if not event:
-        raise ValueError("Event not found")
-
-    if isinstance(event["tables"], list) and all(
-        isinstance(x, str) for x in event["tables"]
-    ):
-        tables = list(tables_db.tables.find({"event_slug": event_slug}))
-    else:
-        tables = event["tables"]
-
-    # Image dimensions and colors
-    WIDTH = 1920
-    HEIGHT = max(1080, 600 + (len(tables) * 200))  # Base height plus 200px per table
-    BACKGROUND = (44, 24, 16)  # Deep brown
-    BORDER_COLOR = (139, 69, 19)  # Saddle brown
-    TEXT_COLOR = (255, 215, 0)  # Gold
-    HEADER_COLOR = (255, 223, 0)  # Bright gold
-    TABLE_BG = (59, 36, 23)  # Darker brown
-
-    def calculate_table_height(table):
-        num_players = len(table.get("joined_players", []))
-        return max(300, 160 + (num_players * 65))
-
-    # Create base image
-    img = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
-    draw = ImageDraw.Draw(img)
-
-    # Load fonts
-    font_path = "resources/fonts/Cinzel-Regular.ttf"
-    bold_font_path = "resources/fonts/Cinzel-Bold.ttf"
-    header_font = ImageFont.truetype(bold_font_path, 120)
-    date_font = ImageFont.truetype(font_path, 60)
-    table_header_font = ImageFont.truetype(bold_font_path, 70)
-    gm_font = ImageFont.truetype(font_path, 65)
-    player_font = ImageFont.truetype(font_path, 40)
-    footer_font = ImageFont.truetype(font_path, 50)
-
-    # Draw main border
-    border_width = 8
-    draw.rectangle(
-        [(border_width, border_width), (WIDTH - border_width, HEIGHT - border_width)],
-        outline=BORDER_COLOR,
-        width=border_width,
-    )
-
-    # Draw event header
-    header_text = event["name"].upper()
-    header_bbox = draw.textbbox((0, 0), header_text, font=header_font)
-    header_width = header_bbox[2] - header_bbox[0]
-    draw.text(
-        ((WIDTH - header_width) // 2, 50), header_text, HEADER_COLOR, font=header_font
-    )
-
-    # Draw date
-    start_date = event["start_date"]
-    end_date = event["end_date"]
-    date_text = start_date if start_date == end_date else f"{start_date} - {end_date}"
-    date_bbox = draw.textbbox((0, 0), date_text, font=date_font)
-    date_width = date_bbox[2] - date_bbox[0]
-    draw.text(((WIDTH - date_width) // 2, 180), date_text, TEXT_COLOR, font=date_font)
-
-    # Table layout calculations
-    table_margin = 40
-    table_padding = 30
-    cols = min(3, len(tables))
-    rows = (len(tables) + cols - 1) // cols
-    table_width = (WIDTH - (table_margin * (cols + 1))) // cols
-    start_y = 300
-
-    # Calculate row heights
-    max_height_per_row = []
-    for row in range(rows):
-        row_heights = []
-        for col in range(cols):
-            idx = row * cols + col
-            if idx < len(tables):
-                height = calculate_table_height(tables[idx])
-                row_heights.append(height)
-        max_height_per_row.append(max(row_heights) if row_heights else 0)
-
-    # Draw tables
-    current_y = start_y
-    for row in range(rows):
-        for col in range(cols):
-            idx = row * cols + col
-            if idx >= len(tables):
-                continue
-
-            table = tables[idx]
-            x = table_margin + (col * (table_width + table_margin))
-            y = current_y
-            table_height = max_height_per_row[row]
-
-            # Table background
-            draw.rounded_rectangle(
-                [(x, y), (x + table_width, y + table_height)],
-                radius=20,
-                fill=TABLE_BG,
-                outline=BORDER_COLOR,
-                width=3,
-            )
-
-            # Game name
-            game_text = table["game_name"].upper()
-            game_bbox = draw.textbbox((0, 0), game_text, font=table_header_font)
-            game_width = game_bbox[2] - game_bbox[0]
-            draw.text(
-                (x + (table_width - game_width) // 2, y + 20),
-                game_text,
-                TEXT_COLOR,
-                font=table_header_font,
-            )
-
-            # Game Master
-            gm_text = f"{table['game_master']}"
-            gm_bbox = draw.textbbox((0, 0), gm_text, font=gm_font)
-            gm_width = gm_bbox[2] - gm_bbox[0]
-            draw.text(
-                (x + (table_width - gm_width) // 2, y + 100),
-                gm_text,
-                TEXT_COLOR,
-                font=gm_font,
-            )
-
-            # Players
-            players = [p["name"].upper() for p in table.get("joined_players", [])]
-            player_y = y + 160
-            player_y = y + 200  # Increased from 160
-            for player in players:
-                player_bbox = draw.textbbox((0, 0), player, font=player_font)
-                player_width = player_bbox[2] - player_bbox[0]
-                draw.text(
-                    (x + (table_width - player_width) // 2, player_y),
-                    player,
-                    TEXT_COLOR,
-                    font=player_font,
-                )
-                player_y += 50
-
-        current_y += max_height_per_row[row] + table_margin
-
-    # Footer with dice
-    footer_text = "EMU RPG CLUB"
-    footer_bbox = draw.textbbox((0, 0), footer_text, font=footer_font)
-    footer_width = footer_bbox[2] - footer_bbox[0]
-    footer_x = (WIDTH - footer_width) // 2
-    footer_y = HEIGHT - 80
-    # Draw footer text
-    draw.text((footer_x, footer_y), footer_text, TEXT_COLOR, font=footer_font)
-
-    # Save image
-    img_buffer = BytesIO()
-    img.save(img_buffer, format="PNG", quality=95)
-    img_buffer.seek(0)
-
-    return img_buffer
-
-
 # Admin Endpoints #
 ####################
 # These endpoints are for the admins to interact with the event system, they return sensitive information.
 
 
-# New Admin Endpoints for Events
+@app.post("/api/admin/games")
+async def create_game(game: Game, request: Request):
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+    games_db.games.insert_one(game.dict())
+    return JSONResponse(
+        content={"message": "Game created successfully"}, status_code=201
+    )
+
+
 @app.post("/api/admin/events")
 async def create_event(event: EventCreate, request: Request):
     """Create a new event with the provided details."""
@@ -594,7 +461,7 @@ async def create_event(event: EventCreate, request: Request):
 
 @app.get("/api/admin/events")
 async def get_admin_events(request: Request):
-    """Get all events from the database with all the sensitive"""
+    """Get all events from the database with all the sensitive data"""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     events = list(events_db.events.find({}, {"_id": 0}))
@@ -724,11 +591,13 @@ async def update_table(slug: str, request: Request):
 
     update_data = {
         "game_name": data.get("game_name", table["game_name"]),
+        "game_id": data.get("game_id", table["game_id"]),
         "game_master": data.get("game_master", table["game_master"]),
         "player_quota": new_quota,
         "total_joined_players": new_joined,
         "joined_players": data.get("joined_players", table["joined_players"]),
         "slug": table["slug"],
+        "language": data.get("language", table["language"]),
         "created_at": data.get("created_at", table["created_at"]),
     }
 
@@ -794,9 +663,13 @@ async def create_table(event_slug: str, request: Request):
 
     table_data = await request.json()
     player_quota = int(table_data.get("player_quota", 0))
+    game_id = games_db.games.find_one({"name": table_data.get("game_name")})
+    if not game_id:
+        raise HTTPException(status_code=404, detail="Game not found")
 
     new_table = {
         "game_name": table_data.get("game_name"),
+        "game_id": game_id["id"],
         "game_master": table_data.get("game_master"),
         "player_quota": player_quota,
         "total_joined_players": 0,
@@ -805,6 +678,10 @@ async def create_table(event_slug: str, request: Request):
         "event_slug": event_slug,
         "event_name": event["name"],
         "created_at": await fetch_current_datetime(),
+        "approved_players": [],
+        "rejected_players": [],
+        "backup_players": [],
+        "language": table_data.get("language", "Turkish"),
     }
 
     tables_db.tables.insert_one(new_table)
@@ -845,15 +722,13 @@ async def add_player(slug: str, player: Player, request: Request):
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     table = tables_db.tables.find_one({"slug": slug})
-    event = events_db.events.find_one({"slug": table["event_slug"]})
+    # event = events_db.events.find_one({"slug": table["event_slug"]}) # For future use
     if not table:
         raise HTTPException(status_code=404, detail="Table not found")
 
-    if table["total_joined_players"] >= table["player_quota"]:
-        raise HTTPException(status_code=400, detail="table is full")
-
     new_player = player.dict()
     new_player["registration_timestamp"] = await fetch_current_datetime()
+    print(new_player)
 
     remaining_seats = int(table["player_quota"]) - (
         int(table["total_joined_players"]) + 1
@@ -920,6 +795,126 @@ async def delete_player(slug: str, student_id: str, request: Request):
     return JSONResponse(content={"message": "Player deleted successfully"})
 
 
+@app.post("/api/admin/approve_player/{slug}/{student_id}")
+async def approve_player(slug: str, student_id: str, request: Request):
+    """Approve a player for the table."""
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    # Find player in joined_players
+    player = None
+    for p in table.get("joined_players", []):
+        if p["student_id"] == student_id:
+            player = p
+            break
+
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    # Remove from backup if already there
+    tables_db.tables.update_one(
+        {"slug": slug},
+        {"$pull": {"backup_players": {"student_id": student_id}}},
+    )
+
+    # Remove from rejected if already there
+    tables_db.tables.update_one(
+        {"slug": slug},
+        {"$pull": {"rejected_players": {"student_id": student_id}}},
+    )
+
+    # Add to approved_players if not already there
+    tables_db.tables.update_one(
+        {"slug": slug, "approved_players.student_id": {"$ne": student_id}},
+        {"$push": {"approved_players": player}},
+    )
+
+    return JSONResponse(content={"message": "Player approved successfully"})
+
+
+@app.post("/api/admin/reject_player/{slug}/{student_id}")
+async def reject_player(slug: str, student_id: str, request: Request):
+    """Reject a player for the table."""
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    # Find player in joined_players
+    player = None
+    for p in table.get("joined_players", []):
+        if p["student_id"] == student_id:
+            player = p
+            break
+
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    # Remove from backup if already there
+    tables_db.tables.update_one(
+        {"slug": slug},
+        {"$pull": {"backup_players": {"student_id": student_id}}},
+    )
+
+    # Remove from approved if already there
+    tables_db.tables.update_one(
+        {"slug": slug},
+        {"$pull": {"approved_players": {"student_id": student_id}}},
+    )
+
+    # Add to rejected_players if not already there
+    tables_db.tables.update_one(
+        {"slug": slug, "rejected_players.student_id": {"$ne": student_id}},
+        {"$push": {"rejected_players": player}},
+    )
+
+    return JSONResponse(content={"message": "Player rejected successfully"})
+
+
+@app.post("/api/admin/backup_player/{slug}/{student_id}")
+async def backup_player(slug: str, student_id: str, request: Request):
+    """Add a player to backup list for the table."""
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    # Find player in joined_players
+    player = None
+    for p in table.get("joined_players", []):
+        if p["student_id"] == student_id:
+            player = p
+            break
+
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    # Remove from approved if already there
+    tables_db.tables.update_one(
+        {"slug": slug},
+        {"$pull": {"approved_players": {"student_id": student_id}}},
+    )
+
+    # Remove from rejected if already there
+    tables_db.tables.update_one(
+        {"slug": slug},
+        {"$pull": {"rejected_players": {"student_id": student_id}}},
+    )
+
+    # Add to backup_players if not already there
+    tables_db.tables.update_one(
+        {"slug": slug, "backup_players.student_id": {"$ne": student_id}},
+        {"$push": {"backup_players": player}},
+    )
+
+    return JSONResponse(content={"message": "Player added to backup successfully"})
+
+
 # User Endpoints #
 ####################
 # These endpoints are for the users to interact with the event system, they don't return sensitive information.
@@ -978,6 +973,22 @@ async def get_tables(request: Request, dependencies=[Depends(check_origin)]):
     return JSONResponse(content=json_tables)
 
 
+@app.get("/api/games")
+async def get_games(request: Request):
+    await check_request(request, checkApiKey=False, checkOrigin=True)
+    games = list(games_db.games.find({}, {"_id": 0}))
+    return JSONResponse(content=games)
+
+
+@app.get("/api/game/{id}")
+async def get_game(id: str, request: Request):
+    await check_request(request, checkApiKey=False, checkOrigin=True)
+    game = games_db.games.find_one({"id": id})
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return JSONResponse(content={"_id": str(game.pop("_id")), **game})
+
+
 @app.get("/api/table/{slug}")
 async def get_table(slug: str, request: Request):
     """Get the table details from the database using the provided slug without sensitive data."""
@@ -999,7 +1010,7 @@ async def get_table(slug: str, request: Request):
 
 @app.post("/api/register/{slug}")
 async def register_table(slug: str, player: Player, request: Request):
-    """Register a player for the table using the provided slug."""
+    """Register a player for the table using the provided slug without quota restriction."""
     await check_request(request, checkApiKey=False, checkOrigin=True)
     table = tables_db.tables.find_one({"slug": slug})
     event = events_db.events.find_one({"slug": table["event_slug"]})
@@ -1015,27 +1026,14 @@ async def register_table(slug: str, player: Player, request: Request):
             status_code=400, detail="Invalid student ID. Must be 8 digits."
         )
 
-    if table["total_joined_players"] >= int(table["player_quota"]):
-        raise HTTPException(status_code=400, detail="table is full, no available seats")
-
     # Convert to dictionary and add registration timestamp
     new_player = player.model_dump()
-    new_player["registration_timestamp"] = (
-        datetime.now().isoformat()
-    )  # Store as ISO string
+    new_player["registration_timestamp"] = datetime.now().isoformat()
 
     tables_db.tables.update_one(
         {"slug": slug},
         {"$push": {"joined_players": new_player}, "$inc": {"total_joined_players": 1}},
     )
-    remaining_seats = int(table["player_quota"]) - (
-        int(table["total_joined_players"]) + 1
-    )
-    update_fields = {"available_seats": -1}
-    if remaining_seats == 0:
-        update_fields["available_tables"] = -1
-
-    events_db.events.update_one({"slug": table["event_slug"]}, {"$inc": update_fields})
 
     return JSONResponse(content={"message": "Registration successful"})
 
@@ -1143,7 +1141,7 @@ async def generate_event_announcement(slug: str, request: Request):
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     try:
-        img_buffer = create_event_announcement(slug)
+        img_buffer = create_event_announcement(slug, events_db, tables_db)
         return StreamingResponse(img_buffer, media_type="image/png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
