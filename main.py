@@ -22,7 +22,6 @@ from hashlib import sha256
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from io import BytesIO
-import httpx
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -1166,6 +1165,7 @@ async def generate_event_announcement(slug: str, request: Request):
         img_buffer = create_event_announcement(slug, events_db, tables_db)
         return StreamingResponse(img_buffer, media_type="image/png")
     except Exception as e:
+        print(f"Error generating announcement for event {slug}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
