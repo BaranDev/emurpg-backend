@@ -1,4 +1,5 @@
 import json
+import time
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -25,6 +26,7 @@ import httpx
 import matplotlib.font_manager as fm
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from datetime import datetime, timedelta, timezone
 
 # from moesifasgi import MoesifMiddleware # DISABLED FOR NOW
 import asyncio
@@ -38,6 +40,8 @@ DEV = False
 WS_MESSAGE = "Records updated"
 load_dotenv()
 
+# Global variable to cache the time
+time_cache = {"time": None, "last_updated": 0, "expiry": 300}  # 5 minutes cache
 
 # MongoDB connection
 ws_client = AsyncIOMotorClient(os.environ.get("MONGO_URI"))
@@ -343,6 +347,7 @@ async def check_api_key(request: Request):
     """Check if the API key is valid and exists in the database."""
     if DEV:
         return True
+
     # Extract the "apiKey" header from the request
     api_key_header = request.headers.get("apiKey")
 
@@ -369,11 +374,15 @@ async def check_api_key(request: Request):
     # Check if the API key exists in the database
     status = api_db.api_keys.find_one({"api_key": api_key})
     if status:
-        # Update the usage time in the database
-        current_time = await fetch_current_datetime()
-        api_db.api_keys.update_one(
-            {"api_key": api_key}, {"$push": {"used_times": current_time}}
-        )
+        try:
+            # Update the usage time in the database but don't block if this fails
+            current_time = await fetch_current_datetime()
+            api_db.api_keys.update_one(
+                {"api_key": api_key}, {"$push": {"used_times": current_time}}
+            )
+        except Exception as e:
+            # Log but continue if we can't update usage times
+            print(f"Error updating API key usage time: {e}")
         return True
 
     # Raise error if the API key is invalid
@@ -401,13 +410,44 @@ async def check_origin(request: Request):
 
 
 async def fetch_current_datetime():
-    """Fetch the current datetime from Time API in Cyprus timezone."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://timeapi.io/api/time/current/zone?timeZone=Europe%2FAthens"
-        )
-        response.raise_for_status()
-        return response.json()["dateTime"]
+    """Use the server's time and convert to GMT+2 (Eastern European Time)."""
+    current_timestamp = time.time()
+
+    # Use cached time if available and not expired
+    if (
+        time_cache["time"]
+        and (current_timestamp - time_cache["last_updated"]) < time_cache["expiry"]
+    ):
+        return time_cache["time"]
+
+    try:
+        # Get UTC time from server
+        utc_now = datetime.now(timezone.utc)
+
+        # Convert to GMT+2 (Eastern European Time)
+        eet_timezone = timezone(timedelta(hours=2))
+        eet_time = utc_now.astimezone(eet_timezone)
+
+        # Format the time as ISO format
+        formatted_time = eet_time.isoformat()
+
+        # Update cache
+        time_cache["time"] = formatted_time
+        time_cache["last_updated"] = current_timestamp
+
+        return formatted_time
+
+    except Exception as e:
+        # Fall back to simple UTC conversion if something goes wrong
+        print(f"Error converting time: {e}")
+        utc_time = datetime.now(timezone.utc)
+        gmt2_time = (utc_time + timedelta(hours=2)).isoformat()
+
+        # Update cache
+        time_cache["time"] = gmt2_time
+        time_cache["last_updated"] = current_timestamp
+
+        return gmt2_time
 
 
 async def check_request(
