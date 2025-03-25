@@ -721,6 +721,7 @@ async def create_table(event_slug: str, request: Request):
         "rejected_players": [],
         "backup_players": [],
         "language": table_data.get("language", "Turkish"),
+        "is_marked_full": False,
     }
 
     tables_db.tables.insert_one(new_table)
@@ -741,6 +742,24 @@ async def create_table(event_slug: str, request: Request):
         content={"message": "Table created successfully", "slug": new_table["slug"]},
         status_code=201,
     )
+
+
+@app.post("/api/admin/set_table_full/{slug}")
+async def set_table_full(slug: str, request: Request):
+    """Set the table as full using the provided slug."""
+    await check_request(request, checkApiKey=True, checkOrigin=True)
+
+    table = tables_db.tables.find_one({"slug": slug})
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    current_status = table.get("is_marked_full", False)
+
+    tables_db.tables.update_one(
+        {"slug": slug}, {"$set": {"is_marked_full": not current_status}}
+    )
+
+    return JSONResponse(content={"message": "Table marked as full successfully"})
 
 
 @app.get("/api/admin/get_players/{slug}")
@@ -1082,30 +1101,35 @@ async def update_event(slug: str, request: Request):
 
 @app.post("/api/admin/generate-report")
 async def generate_report(request: Request):
-    """Generate a CSV report for all events."""
+    """Generate a CSV report for all events with detailed metrics."""
     await check_request(request, checkApiKey=True, checkOrigin=True)
 
     data = await request.json()
     report_type = data.get("type")
     language = data.get("language", "en")  # Default to English
-    print(f"Generating report in {language} for type: {report_type}")
+    format_type = data.get("format", "csv")  # Default to CSV
+    print(f"Generating {format_type} report in {language} for type: {report_type}")
 
     # Language mappings
     translations = {
         "en": {
-            "headers": "Event Name,Event Status,Start Date,End Date,Total Tables,Total Players,Total Player Quota,Fill Rate",
+            "event_headers": "Event Name,Event Status,Start Date,End Date,Total Tables,Total Players,Total Player Quota,Fill Rate,Available Tables,Available Seats",
+            "table_headers": "Event Name,Table Name,Game Master,Language,Player Quota,Joined Players,Approved Players,Rejected Players,Backup Players,Fill Rate",
             "ongoing": "Ongoing",
             "finished": "Finished",
         },
         "tr": {
-            "headers": "Etkinlik Adı,Etkinlik Durumu,Başlangıç Tarihi,Bitiş Tarihi,Toplam Masa,Toplam Oyuncu,Toplam Kontenjan,Doluluk Oranı",
+            "event_headers": "Etkinlik Adı,Etkinlik Durumu,Başlangıç Tarihi,Bitiş Tarihi,Toplam Masa,Toplam Oyuncu,Toplam Kontenjan,Doluluk Oranı,Müsait Masa,Müsait Koltuk",
+            "table_headers": "Etkinlik Adı,Masa Adı,Oyun Yöneticisi,Dil,Oyuncu Kontenjanı,Katılan Oyuncular,Onaylanan Oyuncular,Reddedilen Oyuncular,Yedek Oyuncular,Doluluk Oranı",
             "ongoing": "Devam Ediyor",
             "finished": "Tamamlandı",
         },
     }
 
-    headers = translations[language]["headers"]
+    event_headers = translations[language]["event_headers"]
+    table_headers = translations[language]["table_headers"]
 
+    # Get events based on report type
     if report_type == "current":
         events_list = list(events_db.events.find({}, {"_id": 0}))
     elif report_type == "previous":
@@ -1117,43 +1141,111 @@ async def generate_report(request: Request):
     else:
         raise HTTPException(status_code=400, detail="Invalid report type")
 
-    csv_rows = [headers]
+    # Generate event summary CSV
+    event_rows = [event_headers]
+    # Generate detailed table CSV
+    table_rows = [table_headers]
 
     for event in events_list:
         total_players = 0
         total_quota = 0
+        approved_players = 0
+        rejected_players = 0
+        backup_players = 0
 
+        # Get tables data
         if isinstance(event["tables"], list) and all(
             isinstance(x, str) for x in event["tables"]
         ):
+            # For ongoing events with table slugs
             tables = list(tables_db.tables.find({"event_slug": event["slug"]}))
         else:
+            # For archived events with embedded tables
             tables = event["tables"]
 
+        # Process each table
         for table in tables:
-            total_players += int(table["total_joined_players"])
-            total_quota += int(table["player_quota"])
+            # For event summary metrics
+            players_count = int(table["total_joined_players"])
+            quota = int(table["player_quota"])
+            total_players += players_count
+            total_quota += quota
 
+            # Get detailed player status counts
+            table_approved = len(table.get("approved_players", []))
+            table_rejected = len(table.get("rejected_players", []))
+            table_backup = len(table.get("backup_players", []))
+            approved_players += table_approved
+            rejected_players += table_rejected
+            backup_players += table_backup
+
+            # Calculate table fill rate
+            table_fill_rate = (players_count / quota * 100) if quota > 0 else 0
+
+            # Add detailed table row
+            table_rows.append(
+                f"\"{event['name']}\","
+                f"\"{table['game_name']}\","
+                f"\"{table['game_master']}\","
+                f"\"{table.get('language', 'N/A')}\","
+                f"{quota},"
+                f"{players_count},"
+                f"{table_approved},"
+                f"{table_rejected},"
+                f"{table_backup},"
+                f"{table_fill_rate:.2f}%"
+            )
+
+        # Calculate event fill rate
         fill_rate = (total_players / total_quota * 100) if total_quota > 0 else 0
         status = (
             translations[language]["ongoing"]
-            if event["is_ongoing"]
+            if event.get("is_ongoing", False)
             else translations[language]["finished"]
         )
 
-        csv_rows.append(
-            f"{event['name']},"
+        # Add event summary row
+        event_rows.append(
+            f"\"{event['name']}\","
             f"{status},"
             f"{event['start_date']},"
             f"{event['end_date']},"
             f"{event['total_tables']},"
             f"{total_players},"
             f"{total_quota},"
-            f"{fill_rate:.2f}%"
+            f"{fill_rate:.2f}%,"
+            f"{event.get('available_tables', 0)},"
+            f"{event.get('available_seats', 0)}"
         )
 
-    csv_content = "\n".join(csv_rows)
-    return JSONResponse(content={"csv": csv_content})
+    # Combine event and table data into a structured response
+    event_csv = "\n".join(event_rows)
+    table_csv = "\n".join(table_rows)
+
+    # Add timestamp to the report
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return JSONResponse(
+        content={
+            "timestamp": timestamp,
+            "event_summary": event_csv,
+            "table_details": table_csv,
+            "stats": {
+                "total_events": len(events_list),
+                "total_tables": sum(event["total_tables"] for event in events_list),
+                "total_players": sum(
+                    int(table["total_joined_players"])
+                    for event in events_list
+                    for table in (
+                        tables_db.tables.find({"event_slug": event["slug"]})
+                        if isinstance(event["tables"], list)
+                        and all(isinstance(x, str) for x in event["tables"])
+                        else event["tables"]
+                    )
+                ),
+            },
+        }
+    )
 
 
 @app.get("/api/admin/events/{slug}/announcement")
